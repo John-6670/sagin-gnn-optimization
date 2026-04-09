@@ -1,0 +1,15 @@
+simulation:
+  area_size: 2000
+
+network:
+  noise_power: 0.001
+  pathloss_exp: 2.0
+
+algorithm:
+  alpha: 0.5   # latency weight
+  beta: 0.5    # AMSE weight
+  budget: 5
+
+traffic:
+  num_clients: 20
+  demand_mean: 1.0
