@@ -1,6 +1,6 @@
 from typing import List
 from optimization.objective import weighted_compound_loss
-from simulation.topology.amse import compute_amse
+from simulation.topology.aircomp import compute_amse
 from simulation.network.latency import propagation_latency
 from simulation.network.models import NetworkModel
 from simulation.topology.nodes import Node
