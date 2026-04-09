@@ -1,0 +1,85 @@
+# =========================
+# General
+# =========================
+
+.DS_Store
+Thumbs.db
+
+# =========================
+# C++ / ns-3
+# =========================
+
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.o
+*.out
+*.a
+*.so
+*.exe
+*.log
+
+# ns-3 specific
+
+*.tr
+*.pcap
+*.xml
+*.json
+
+# =========================
+# Python
+# =========================
+
+**pycache**/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+
+.env/
+.venv/
+
+# =========================
+# Machine Learning / Experiments
+# =========================
+
+checkpoints/
+models/
+logs/
+runs/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# Jupyter
+.ipynb_checkpoints/
+
+# =========================
+# Data files
+# =========================
+
+data/
+*.csv
+*.tsv
+
+# =========================
+# IDEs / Editors
+# =========================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# OS / Misc
+# =========================
+
+*.tmp
+*.bak
+*.cache

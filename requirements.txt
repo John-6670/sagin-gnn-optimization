@@ -1,0 +1,22 @@
+# Core
+numpy
+pandas
+scipy
+
+# Machine Learning
+torch
+torchvision
+torchaudio
+scikit-learn
+
+# Graph Neural Networks
+torch-geometric
+
+# Utilities
+networkx
+tqdm
+matplotlib
+seaborn
+
+# Config / experiments
+pyyaml
