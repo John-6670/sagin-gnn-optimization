@@ -1,41 +1,65 @@
 from typing import List
-from optimization.objective import weighted_compound_loss
-from simulation.topology.aircomp import compute_amse
-from simulation.network.latency import propagation_latency
-from simulation.network.models import NetworkModel
+
 from simulation.topology.nodes import Node
+from optimization.objective import compute_utility
 
 
-def greedy_placement(
-    candidates: List[Node],
-    clients: List[Node],
-    network_model: NetworkModel,
-    budget: int = 5,
-    alpha: float = 0.5,
-    beta: float = 0.5,
+def greedy_server_selection(
+    candidate_servers,   # list of Node
+    clients,             # list of Node
+    budget,              # max number of servers
+    cost: dict[Node, float],
+    thresh,
+    alpha, beta, delta_list
 ) -> List[Node]:
-    """Greedy server placement based on a weighted latency-AMSE objective."""
-    selected: List[Node] = []
-    remaining_budget = budget
+    snr_map = {
+        client: {
+            server: client.compute_snr_to(server)
+            for server in candidate_servers
+        }
+        for client in clients
+    }
+    best_snr = {client: 0.0 for client in clients}
 
-    while remaining_budget > 0 and candidates:
+    S = []
+    total_cost = 0
+
+    while candidate_servers:
         best_server = None
-        best_score = float("inf")
+        best_gain = -float("inf")
 
-        for server in candidates:
-            total_latency = sum(propagation_latency(server, client) for client in clients)
-            server_amse = compute_amse(server, clients, network_model)
-            score = weighted_compound_loss(total_latency, server_amse, alpha, beta)
+        current_utility = compute_utility(S, clients, alpha, beta, delta_list)
 
-            if score < best_score:
-                best_score = score
+        for server in candidate_servers:
+            if server in S:
+                continue
+
+            print(f'server {server.id} is selected for test!')
+
+            new_S = S + [server]
+            new_utility = compute_utility(new_S, clients, alpha, beta, delta_list)
+            print('utility: ', new_utility)
+
+            gain = (current_utility - new_utility) / cost[server]
+            print('gain: ', gain)
+
+            if gain > best_gain:
+                best_gain = gain
                 best_server = server
 
         if best_server is None:
             break
 
-        selected.append(best_server)
-        candidates.remove(best_server)
-        remaining_budget -= 1
+        delta_snr = 0.0
+        for client in clients:
+            new_snr = snr_map[client][best_server]
+            improvement = max(0.0, new_snr - best_snr[client])
+            delta_snr += improvement
+        
+        if delta_snr > thresh and total_cost+cost[best_server] <= budget:
+            print(f'server {best_server.id} is selected for server!!!')
+            S.append(best_server)
+            total_cost += cost[best_server]
 
-    return selected
+        candidate_servers.remove(best_server)
+    return S

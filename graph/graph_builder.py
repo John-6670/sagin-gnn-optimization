@@ -4,6 +4,7 @@ from typing import List, Tuple
 from simulation.topology.nodes import Node, NodeType, generate_nodes
 from simulation.network.models import SimplePathLossModel
 from optimization.placement import greedy_placement
+from optimization.objective import utility
 
 
 def build_graph(num_sats=3, num_uavs=5, num_ground=10, num_clients=20, area_size=2000) -> Tuple[nx.Graph, List[Node]]:
@@ -34,7 +35,8 @@ def main():
     clients = [n for n in nodes if n.type == NodeType.CLIENT]
     candidates = [n for n in nodes if n.type != NodeType.CLIENT]
 
-    selected = greedy_placement(candidates, clients, SimplePathLossModel(), budget=3)
+    selected = greedy_placement(candidates, clients, budget=3, utility_function=utility, cost= dict[Node, float],
+                                network_model=SimplePathLossModel(), thresh=1e-2, alpha=0.5, beta=0.5)
 
     print(f"Graph nodes: {len(graph.nodes)}")
     print(f"Selected {len(selected)} candidate servers:")

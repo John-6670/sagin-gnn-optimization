@@ -1,45 +1,67 @@
 import argparse
-from typing import List
+from typing import List, Dict
+import numpy as np
 
 from simulation.config_loader import load_config
-from simulation.network.models import SimplePathLossModel
-from simulation.traffic.traffic_generator import generate_traffic
 from simulation.topology.nodes import Node, NodeType, generate_nodes
-from optimization.placement import greedy_placement
+from optimization.placement import greedy_server_selection
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run a small-scale SAGIN placement simulation.")
-    parser.add_argument("--config", default="configs/default.yaml", help="Path to configuration YAML file.")
-    parser.add_argument("--budget", type=int, default=None, help="Number of servers to deploy.")
-    parser.add_argument("--seed", type=int, default=123, help="Random seed for scenario generation.")
+    parser = argparse.ArgumentParser(description="Run a SAGIN placement simulation.")
+    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--budget", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
 
 def summarize_selection(selected_servers: List[Node]) -> str:
     lines = [f"Selected servers ({len(selected_servers)}):"]
     for server in selected_servers:
-        lines.append(f"- {server.id} ({server.type.value}) at {server.position.tolist()}")
+        lines.append(
+            f"- {server.id} ({server.type.value}) at {server.position.tolist()}"
+        )
     return "\n".join(lines)
+
+
+# Cost model (simple for now)
+def build_costs(servers: List[Node]) -> Dict[Node, float]:
+    """
+    Simple cost model:
+    - satellite > uav > ground
+    """
+    cost = {}
+
+    for s in servers:
+        if s.type == NodeType.SATELLITE:
+            cost[s] = 10.0
+        elif s.type == NodeType.UAV:
+            cost[s] = 5.0
+        else:
+            cost[s] = 1.0
+
+    return cost
 
 
 def main():
     args = parse_args()
     config = load_config(args.config)
 
-    num_sats = config["simulation"].get("num_sats", 3)
-    num_uavs = config["simulation"].get("num_uavs", 5)
-    num_ground = config["simulation"].get("num_ground", 10)
-    num_clients = config["traffic"].get("num_clients", 20)
+    num_sats = config["simulation"].get("num_sats", 1)
+    num_uavs = config["simulation"].get("num_uavs", 2)
+    num_ground = config["simulation"].get("num_ground", 4)
+    num_clients = config["simulation"].get("num_clients", 20)
     area_size = config["simulation"].get("area_size", 2000)
 
     alpha = config["algorithm"].get("alpha", 0.5)
     beta = config["algorithm"].get("beta", 0.5)
-    budget = args.budget or config["algorithm"].get("budget", 5)
+    delta_list = config["algorithm"].get("delta_list", [0.1, 0.2])
+
+    budget = args.budget or config["algorithm"].get("budget", 20)
+
+    thresh = config["algorithm"].get("snr_threshold", 0.0)
 
     if args.seed is not None:
-        import numpy as np
-
         np.random.seed(args.seed)
 
     nodes = generate_nodes(
@@ -53,27 +75,27 @@ def main():
     clients = [n for n in nodes if n.type == NodeType.CLIENT]
     candidates = [n for n in nodes if n.type != NodeType.CLIENT]
 
-    network_model = SimplePathLossModel(
-        noise_power=config["network"].get("noise_power", 0.001),
-        pathloss_exp=config["network"].get("pathloss_exp", 2.0),
-    )
+    cost = build_costs(candidates)
 
-    traffic_profile = generate_traffic(num_clients, mean=config["traffic"].get("demand_mean", 1.0))
-
-    selected_servers = greedy_placement(
-        candidates=candidates,
+    print('begin algorithm')
+    selected_servers = greedy_server_selection(
+        candidate_servers=candidates,
         clients=clients,
-        network_model=network_model,
         budget=budget,
+        cost=cost,
+        thresh=thresh,
         alpha=alpha,
         beta=beta,
+        delta_list=delta_list,
     )
+    print('end algorithm')
 
     print("=== SAGIN Simulation Summary ===")
-    print(f"Area size: {area_size} x {area_size} km")
+    print(f"Area size: {area_size} x {area_size}")
     print(f"Total nodes: {len(nodes)}")
     print(f"Clients: {len(clients)}, candidates: {len(candidates)}")
-    print(f"Traffic sample: {traffic_profile[:5].tolist()} ...")
+    print(f"Alpha={alpha}, Beta={beta}")
+    print(f"Budget (cost): {budget}")
     print(summarize_selection(selected_servers))
 
 
