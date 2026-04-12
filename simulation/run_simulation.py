@@ -74,6 +74,7 @@ def main():
 
     clients = [n for n in nodes if n.type == NodeType.CLIENT]
     candidates = [n for n in nodes if n.type != NodeType.CLIENT]
+    n_can = len(candidates)
 
     cost = build_costs(candidates)
 
@@ -93,7 +94,7 @@ def main():
     print("=== SAGIN Simulation Summary ===")
     print(f"Area size: {area_size} x {area_size}")
     print(f"Total nodes: {len(nodes)}")
-    print(f"Clients: {len(clients)}, candidates: {len(candidates)}")
+    print(f"Clients: {len(clients)}, candidates: {n_can}")
     print(f"Alpha={alpha}, Beta={beta}")
     print(f"Budget (cost): {budget}")
     print(summarize_selection(selected_servers))
