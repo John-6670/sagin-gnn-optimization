@@ -16,7 +16,7 @@ class Node:
         node_id,
         node_type: NodeType,
         position,
-        power=0.0,
+        power=1.0,
         noise_variance=1e-9,
         gradient_dim=100,
     ):

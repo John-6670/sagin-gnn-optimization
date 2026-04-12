@@ -1,15 +1,13 @@
 simulation:
+  num_sats: 3
+  num_uavs: 5
+  num_ground: 10
+  num_clients: 20
   area_size: 2000
 
-network:
-  noise_power: 0.001
-  pathloss_exp: 2.0
-
 algorithm:
-  alpha: 0.5   # latency weight
-  beta: 0.5    # AMSE weight
-  budget: 30
-
-traffic:
-  num_clients: 5
-  demand_mean: 1.0
+  alpha: 0.5
+  beta: 0.5
+  budget: 20
+  delta_list: [0.1, 0.2]
+  snr_threshold: 0.0
