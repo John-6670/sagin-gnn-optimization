@@ -5,6 +5,7 @@ import numpy as np
 from simulation.config_loader import load_config
 from simulation.topology.nodes import Node, NodeType, generate_nodes
 from optimization.placement import greedy_server_selection
+from optimization.baselines import lop_selection, go_selection, nrs_selection, random_selection
 
 
 def parse_args():
@@ -60,6 +61,15 @@ def main():
     budget = args.budget or config["algorithm"].get("budget", 20)
 
     thresh = config["algorithm"].get("snr_threshold", 0.0)
+    alg = config['simulation'].get('algorithm', 'all')
+
+    algorithms = {
+        "greedy": greedy_server_selection,
+        "lop": lop_selection,
+        "go": go_selection,
+        "nrs": nrs_selection,
+        "random": random_selection,
+    }
 
     if args.seed is not None:
         np.random.seed(args.seed)
