@@ -60,11 +60,14 @@ simulation:
   num_ground: 10
   num_clients: 20
   area_size: 2000
+  gradient_dim: 100
+  sigma2: 10
+  algorithm: test
 
 algorithm:
   alpha: 0.5
   beta: 0.5
-  budget: 20
+  budget: 10
   delta_list: [0.1, 0.2]
   snr_threshold: 0.0
 ```
@@ -76,6 +79,9 @@ Controls the generated SAGIN topology:
 - `num_ground` — number of ground base stations
 - `num_clients` — number of user devices
 - `area_size` — size of simulation area (square)
+- `gradient_dim` — gradient dimension of nodes
+- `sigma2` — noise variance
+- `algorithm` — select algorithm (greedy, go, lop, nrs, random)
 
 ### `algorithm` Section
 Controls placement and optimization:
@@ -116,7 +122,17 @@ Servers are selected iteratively based on:
 - Deployment cost
 - SNR gain threshold
 
-This approximates submodular optimization under budget constraints.
+### Lop Selection
+servers are selected iteratively based on total latency
+
+### Go Selection
+servers are selected like greedy algorithm just candidates are only ground stations.
+
+### Nrs Selection
+Servers are selected like greedy algorithm just without threshold.
+
+### Random Selection
+servers are selected randomly from candidates until either no more candidates exits or budget finishes.
 
 
 ## 📊 Output
