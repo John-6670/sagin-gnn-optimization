@@ -4,7 +4,9 @@ simulation:
   num_ground: 10
   num_clients: 20
   area_size: 2000
-  algorithm: all
+  gradient_dim: 100
+  sigma2: 10
+  algorithm: test
 
 algorithm:
   alpha: 0.5

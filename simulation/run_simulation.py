@@ -1,9 +1,12 @@
 import argparse
 from typing import List, Dict
 import numpy as np
+from matplotlib import pyplot as plt
+import os
 
 from simulation.config_loader import load_config
 from simulation.topology.nodes import Node, NodeType, generate_nodes
+from simulation.topology.aircomp import compute_amse_kn, compute_amse_n
 from optimization.placement import greedy_server_selection
 from optimization.baselines import lop_selection, go_selection, nrs_selection, random_selection
 
@@ -44,6 +47,45 @@ def build_costs(servers: List[Node]) -> Dict[Node, float]:
     return cost
 
 
+def plot_barCharts(main_dict):
+
+    os.makedirs("./results", exist_ok=True)
+    for outer_key in main_dict:
+        inner_dict = main_dict[outer_key]
+        data = []
+        
+        # Collect the object's id, type, and corresponding value
+        for obj, value in inner_dict.items():
+            label = obj.id
+            data.append( (label, value) )
+        
+        # Sort by object id numerically, then by type
+        sorted_data = sorted(data)
+        labels = [item[0] for item in sorted_data]
+        values = [item[1] for item in sorted_data]
+        
+        # Create the bar chart
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(labels, values)
+        
+        plt.title(f"Bar Chart for {outer_key}")
+        plt.xlabel("Object Type-ID")
+        plt.ylabel("Float Value")
+        
+        # Add value labels on top of each bar
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.2f}',
+                    ha='center', va='bottom')
+        
+        # Rotate x-axis labels for better readability
+        plt.xticks(rotation=45, ha='right')
+        
+        plt.savefig(f'./results/{outer_key}')
+        plt.close()
+
+
 def main():
     args = parse_args()
     config = load_config(args.config)
@@ -53,6 +95,8 @@ def main():
     num_ground = config["simulation"].get("num_ground", 4)
     num_clients = config["simulation"].get("num_clients", 20)
     area_size = config["simulation"].get("area_size", 2000)
+    gradient_dim = config['simulation'].get('gradient_dim', 100)
+    sigma2 = config['simulation'].get('sigma2', 10)
     alg = config['simulation'].get('algorithm', 'all')
 
     alpha = config["algorithm"].get("alpha", 0.5)
@@ -81,6 +125,7 @@ def main():
         num_ground=num_ground,
         num_clients=num_clients,
         area_size=area_size,
+        gradient_dim=gradient_dim
     )
 
     clients = [n for n in nodes if n.type == NodeType.CLIENT]
@@ -90,7 +135,8 @@ def main():
 
     cost = build_costs(candidates)
 
-    if alg == 'all':
+    if alg in ['all', 'test']:
+        total_amse_n = {}
         for name, algo in algorithms.items():
             print(f'begin algorithm {name}')
             selected_servers = algo(
@@ -110,6 +156,16 @@ def main():
             print(f"Alpha={alpha}, Beta={beta}")
             print(f"Budget: {budget}")
             print(summarize_selection(selected_servers))
+
+            if alg == 'test':
+                amse_n = {}
+                for n in selected_servers:
+                    snr_dic = {k: k.compute_snr_to(n) for k in clients}
+                    amse_n[n] = compute_amse_n(snr_dic, sigma2, gradient_dim)
+                total_amse_n[name] = amse_n
+
+        plot_barCharts(total_amse_n)
+
     else:
         algo = algorithms[alg]
         print(f'begin algorithm {alg}')

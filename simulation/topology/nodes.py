@@ -89,6 +89,7 @@ def generate_nodes(
     num_ground=10,
     num_clients=20,
     area_size=2000,
+    gradient_dim=100
 ) -> List[Node]:
 
     nodes: List[Node] = []
@@ -97,18 +98,18 @@ def generate_nodes(
     for i in range(num_sats):
         x, y = np.random.uniform(0, area_size, 2)
         z = np.random.uniform(500, 2000)
-        nodes.append(Node(f"sat-{i}", NodeType.SATELLITE, (x, y, z)))
+        nodes.append(Node(f"sat-{i}", NodeType.SATELLITE, (x, y, z), gradient_dim=gradient_dim))
 
     # UAVs
     for i in range(num_uavs):
         x, y = np.random.uniform(0, area_size, 2)
         z = np.random.uniform(20, 50)
-        nodes.append(Node(f"uav-{i}", NodeType.UAV, (x, y, z)))
+        nodes.append(Node(f"uav-{i}", NodeType.UAV, (x, y, z), gradient_dim=gradient_dim))
 
     # Ground stations
     for i in range(num_ground):
         x, y = np.random.uniform(0, area_size, 2)
-        nodes.append(Node(f"gbs-{i}", NodeType.GROUND, (x, y, 0)))
+        nodes.append(Node(f"gbs-{i}", NodeType.GROUND, (x, y, 0), gradient_dim=gradient_dim))
 
     # Clients
     for i in range(num_clients):
@@ -117,7 +118,8 @@ def generate_nodes(
             f"client-{i}",
             NodeType.CLIENT,
             (x, y, 0),
-            power=1.0  # only clients transmit
+            power=1.0,  # only clients transmit,
+            gradient_dim=gradient_dim
         ))
 
     return nodes
