@@ -4,10 +4,11 @@ simulation:
   num_ground: 10
   num_clients: 20
   area_size: 2000
+  algorithm: all
 
 algorithm:
   alpha: 0.5
   beta: 0.5
-  budget: 20
+  budget: 10
   delta_list: [0.1, 0.2]
   snr_threshold: 0.0

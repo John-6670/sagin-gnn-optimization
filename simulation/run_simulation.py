@@ -53,6 +53,7 @@ def main():
     num_ground = config["simulation"].get("num_ground", 4)
     num_clients = config["simulation"].get("num_clients", 20)
     area_size = config["simulation"].get("area_size", 2000)
+    alg = config['simulation'].get('algorithm', 'all')
 
     alpha = config["algorithm"].get("alpha", 0.5)
     beta = config["algorithm"].get("beta", 0.5)
@@ -61,7 +62,7 @@ def main():
     budget = args.budget or config["algorithm"].get("budget", 20)
 
     thresh = config["algorithm"].get("snr_threshold", 0.0)
-    alg = config['simulation'].get('algorithm', 'all')
+    
 
     algorithms = {
         "greedy": greedy_server_selection,
@@ -85,29 +86,50 @@ def main():
     clients = [n for n in nodes if n.type == NodeType.CLIENT]
     candidates = [n for n in nodes if n.type != NodeType.CLIENT]
     n_can = len(candidates)
+    g_can = len([n for n in candidates if n.type == NodeType.GROUND])
 
     cost = build_costs(candidates)
 
-    print('begin algorithm')
-    selected_servers = greedy_server_selection(
-        candidate_servers=candidates,
-        clients=clients,
-        budget=budget,
-        cost=cost,
-        thresh=thresh,
-        alpha=alpha,
-        beta=beta,
-        delta_list=delta_list,
-    )
-    print('end algorithm')
-
-    print("=== SAGIN Simulation Summary ===")
-    print(f"Area size: {area_size} x {area_size}")
-    print(f"Total nodes: {len(nodes)}")
-    print(f"Clients: {len(clients)}, candidates: {n_can}")
-    print(f"Alpha={alpha}, Beta={beta}")
-    print(f"Budget (cost): {budget}")
-    print(summarize_selection(selected_servers))
+    if alg == 'all':
+        for name, algo in algorithms.items():
+            print(f'begin algorithm {name}')
+            selected_servers = algo(
+                candidates=candidates,
+                clients=clients,
+                budget=budget,
+                cost=cost,
+                thresh=thresh,
+                alpha=alpha,
+                beta=beta,
+                delta_list=delta_list
+            )
+            print(f'--- Algorithm {name} Summary ---')
+            print(f"Area size: {area_size} x {area_size}")
+            print(f"Total nodes: {len(nodes)}")
+            print(f"Clients: {len(clients)}, candidates: {n_can if name != 'go' else g_can}")
+            print(f"Alpha={alpha}, Beta={beta}")
+            print(f"Budget: {budget}")
+            print(summarize_selection(selected_servers))
+    else:
+        algo = algorithms[alg]
+        print(f'begin algorithm {alg}')
+        selected_servers = algo(
+            candidates=candidates,
+            clients=clients,
+            budget=budget,
+            cost=cost,
+            thresh=thresh,
+            alpha=alpha,
+            beta=beta,
+            delta_list=delta_list
+        )
+        print(f'--- Algorithm {alg} Summary ---')
+        print(f"Area size: {area_size} x {area_size}")
+        print(f"Total nodes: {len(nodes)}")
+        print(f"Clients: {len(clients)}, candidates: {n_can if alg != 'go' else g_can}")
+        print(f"Alpha={alpha}, Beta={beta}")
+        print(f"Budget: {budget}")
+        print(summarize_selection(selected_servers))
 
 
 if __name__ == "__main__":

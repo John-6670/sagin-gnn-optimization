@@ -5,7 +5,7 @@ from optimization.objective import compute_utility
 
 
 def greedy_server_selection(
-    candidate_servers,   # list of Node
+    candidates,   # list of Node
     clients,             # list of Node
     budget,              # max number of servers
     cost: dict[Node, float],
@@ -15,7 +15,7 @@ def greedy_server_selection(
     snr_map = {
         client: {
             server: client.compute_snr_to(server)
-            for server in candidate_servers
+            for server in candidates
         }
         for client in clients
     }
@@ -23,26 +23,22 @@ def greedy_server_selection(
 
     S = []
     total_cost = 0
+    candidates_cp = candidates.copy()
 
-    while candidate_servers:
+    while candidates_cp:
         best_server = None
         best_gain = -float("inf")
 
         current_utility = compute_utility(S, clients, alpha, beta, delta_list)
 
-        for server in candidate_servers:
+        for server in candidates_cp:
             if server in S:
                 continue
 
-            print(f'server {server.id} is selected for test!')
-
             new_S = S + [server]
             new_utility = compute_utility(new_S, clients, alpha, beta, delta_list)
-            print('utility: ', new_utility)
 
             gain = (current_utility - new_utility) / cost[server]
-            print('gain: ', gain)
-
             if gain > best_gain:
                 best_gain = gain
                 best_server = server
@@ -57,9 +53,8 @@ def greedy_server_selection(
             delta_snr += improvement
         
         if delta_snr > thresh and total_cost+cost[best_server] <= budget:
-            print(f'server {best_server.id} is selected for server!!!')
             S.append(best_server)
             total_cost += cost[best_server]
 
-        candidate_servers.remove(best_server)
+        candidates_cp.remove(best_server)
     return S

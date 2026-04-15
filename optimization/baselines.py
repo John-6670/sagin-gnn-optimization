@@ -4,7 +4,7 @@ from optimization.placement import greedy_server_selection
 from simulation.topology.nodes import NodeType
 
 
-def lop_selection(candidates, clients, budget):
+def lop_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list):
     selected = []
 
     for _ in range(budget):
@@ -30,30 +30,34 @@ def lop_selection(candidates, clients, budget):
     return selected
 
 
-def go_selection(nodes, clients, budget, **kwargs):
-    ground_nodes = [n for n in nodes if n.type == NodeType.GROUND]
+def go_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list):
+    ground_candidates = [n for n in candidates if n.type == NodeType.GROUND]
 
     return greedy_server_selection(
-        candidate_servers=ground_nodes,
-        clients=clients,
-        budget=budget,
-        **kwargs
-    )
-
-
-def nrs_selection(candidates, clients, budget, cost, alpha, beta, delta_list):
-    # same greedy but NO threshold
-    return greedy_server_selection(
-        candidate_servers=candidates,
+        candidates=ground_candidates,
         clients=clients,
         budget=budget,
         cost=cost,
-        thresh=-float("inf"),  # disables threshold
+        thresh=thresh,
         alpha=alpha,
         beta=beta,
         delta_list=delta_list
     )
 
 
-def random_selection(candidates, budget):
+def nrs_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list):
+    # same greedy but NO threshold
+    return greedy_server_selection(
+        candidates=candidates,
+        clients=clients,
+        budget=budget,
+        cost=cost,
+        thresh=float("-inf"),  # disables threshold
+        alpha=alpha,
+        beta=beta,
+        delta_list=delta_list
+    )
+
+
+def random_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list):
     return random.sample(candidates, min(budget, len(candidates)))
