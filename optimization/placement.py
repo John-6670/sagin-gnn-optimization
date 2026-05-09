@@ -4,7 +4,7 @@ from simulation.topology.nodes import Node
 
 def optimize_ota_parameters(selected_servers: List[Node], clients: List[Node], t_now, target_amse=1e-4):
     """
-    Inner Loop: Optimizes power allocation to minimize instantaneous AMSE[cite: 125, 211].
+    Inner Loop: Optimizes power allocation to minimize instantaneous AMSE
     """
     ota_config = {}
     
@@ -31,7 +31,7 @@ def greedy_server_selection(
     candidates, clients, budget, cost, thresh, alpha, beta, delta_list, t_now
 ):
     """
-    Outer Loop: Adapts placement to orbital patterns (Slow timescale)[cite: 120, 205].
+    Outer Loop: Adapts placement to orbital patterns (Slow timescale).
     """
     S = []
     total_cost = 0

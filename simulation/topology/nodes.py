@@ -44,7 +44,7 @@ class Node:
         return self.position # Simplified for ground nodes
 
     def compute_doppler_shift(self, other, t_now, fc=2.4e9):
-        """Calculates Doppler shift based on relative velocity[cite: 61, 293]."""
+        """Calculates Doppler shift based on relative velocity"""
         c = 3e8
         if self.type != NodeType.SATELLITE: return 0.0
         
@@ -53,7 +53,7 @@ class Node:
         return (v_rel * 1000 / c) * fc 
 
     def get_channel(self, other, t_now):
-        """Generates time-varying channel with Doppler[cite: 61, 62]."""
+        """Generates time-varying channel with Doppler"""
         pos_self = self.get_position_at(t_now)
         pos_other = other.get_position_at(t_now)
         dist = np.linalg.norm(pos_self - pos_other)
