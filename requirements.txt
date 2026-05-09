@@ -20,3 +20,5 @@ seaborn
 
 # Config / experiments
 pyyaml
+
+skyfield

@@ -17,6 +17,7 @@ def parse_args():
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--budget", type=int, default=None)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--algorithm", type=str, default=None, help="Override algorithm (e.g., 'all', 'test', 'greedy')")
     return parser.parse_args()
 
 
@@ -167,6 +168,115 @@ def plot_amse_kn_grouped(total_avg, total_min, total_max, output_dir="plots", lo
         print(f"Saved: {filepath}")
 
 
+def plot_comparison_amse_n(total_amse_n, output_dir="plots"):
+    """
+    Compares all algorithms together for AMSE_n.
+    X-axis represents algorithms; Y-axis is the SUM or MEAN of AMSE across selected servers.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    algo_names = list(total_amse_n.keys())
+    # We compare the average AMSE_n across the servers each algo selected
+    avg_values = [np.mean(list(total_amse_n[algo].values())) if total_amse_n[algo] else 0 
+                    for algo in algo_names]
+    
+    max_val = max(avg_values) if avg_values else 1.0
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    bars = ax.bar(algo_names, avg_values, color=plt.cm.Paired(np.linspace(0, 1, len(algo_names))), edgecolor='black')
+    
+    ax.set_ylim(0, max_val * 2)
+    ax.set_ylabel('Mean AMSE_n across Selected Servers')
+    ax.set_title('Algorithm Comparison: Performance Benchmark (AMSE_n)')
+    
+    for bar in bars:
+        height = bar.get_height()
+        label = f'{height:.4e}' if (height < 0.01 or height > 1000) else f'{height:.4f}'
+        ax.text(bar.get_x() + bar.get_width()/2., height + (max_val * 0.05),
+                label, ha='center', va='bottom', fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "comparison_amse_n.png"), dpi=300)
+    plt.close(fig)
+
+
+def plot_comparison_amse_kn(total_avg, total_min, total_max, output_dir="plots"):
+    os.makedirs(output_dir, exist_ok=True)
+    
+    algos = list(total_avg.keys())
+    
+    # Helper to clean lists of inf/nan
+    def get_clean_means(data_dict):
+        means = []
+        for a in algos:
+            vals = list(data_dict[a].values()) if data_dict[a] else [0]
+            # Replace inf with a high penalty or remove them to calculate a real mean
+            clean_vals = [v if np.isfinite(v) else 0 for v in vals] 
+            # If all were inf, we'll handle that below
+            means.append(np.mean(clean_vals))
+        return np.array(means)
+
+    final_avg = get_clean_means(total_avg)
+    final_min = get_clean_means(total_min)
+    final_max = get_clean_means(total_max)
+    
+    # Logic to handle the "Global Max" for ylim when data contains Inf
+    # We find the largest FINITE value to set a reasonable scale
+    all_metrics = np.concatenate([final_avg, final_min, final_max])
+    finite_metrics = all_metrics[np.isfinite(all_metrics)]
+    
+    if len(finite_metrics) > 0 and np.max(finite_metrics) > 0:
+        global_max = np.max(finite_metrics)
+    else:
+        global_max = 1.0 # Fallback if everything is Inf or Zero
+
+    x = np.arange(len(algos))
+    width = 0.25
+    
+    fig, ax = plt.subplots(figsize=(14, 7))
+    b1 = ax.bar(x - width, final_min, width, label='Overall Min', color='#a1d99b', edgecolor='black')
+    b2 = ax.bar(x, final_avg, width, label='Overall Avg', color='#4292c6', edgecolor='black')
+    b3 = ax.bar(x + width, final_max, width, label='Overall Max', color='#ef3b2c', edgecolor='black')
+    
+    # SAFETY CHECK: Set ylim using a finite number
+    ax.set_ylim(0, global_max * 2)
+    
+    def add_labels(bars, original_data_dict):
+        for i, bar in enumerate(bars):
+            algo_name = algos[i]
+            # Check if the original data for this algo was actually infinite
+            # We look at the raw values from the dictionary
+            raw_vals = list(original_data_dict[algo_name].values()) if original_data_dict[algo_name] else []
+            is_inf = any(not np.isfinite(v) for v in raw_vals)
+            
+            height = bar.get_height()
+            
+            if is_inf:
+                label = "INF (Failed)"
+                # Place label at the top of the visible area
+                text_pos = global_max * 1.1 
+            else:
+                label = f'{height:.2e}' if (height < 0.01 or height > 1000) else f'{height:.3f}'
+                text_pos = height + (global_max * 0.05)
+
+            ax.text(bar.get_x() + bar.get_width()/2., text_pos,
+                    label, ha='center', va='bottom', rotation=90, 
+                    fontsize=8, color='red' if is_inf else 'black')
+
+    add_labels(b1, total_min)
+    add_labels(b2, total_avg)
+    add_labels(b3, total_max)
+    
+    ax.set_title('Algorithm Comparison: AMSE_kn (Note: INF values capped for visualization)')
+    ax.set_xticks(x)
+    ax.set_xticklabels(algos)
+    ax.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "comparison_amse_kn_grouped.png"), dpi=300)
+    plt.close(fig)
+
+
 def main():
     args = parse_args()
     config = load_config(args.config)
@@ -178,7 +288,7 @@ def main():
     area_size = config["simulation"].get("area_size", 2000)
     gradient_dim = config['simulation'].get('gradient_dim', 100)
     sigma2 = config['simulation'].get('sigma2', 10)
-    alg = config['simulation'].get('algorithm', 'all')
+    alg = args.algorithm or config['simulation'].get('algorithm', 'all')
 
     alpha = config["algorithm"].get("alpha", 0.5)
     beta = config["algorithm"].get("beta", 0.5)
@@ -278,6 +388,14 @@ def main():
             
             # 2. Plot grouped Min/Avg/Max AMSE_kn per server
             plot_amse_kn_grouped(total_amse_kn_avg, total_amse_kn_min, total_amse_kn_max, output_dir="plots", log_scale=True)
+
+            plot_comparison_amse_n(total_amse_n)
+            
+            plot_comparison_amse_kn(
+                total_amse_kn_avg, 
+                total_amse_kn_min, 
+                total_amse_kn_max
+            )
 
     else:
         algo = algorithms[alg]

@@ -1,7 +1,7 @@
 from enum import Enum
-from typing import List
+from typing import List, Dict
 import numpy as np
-
+from skyfield.api import Topos, load, EarthSatellite
 
 class NodeType(Enum):
     SATELLITE = "sat"
@@ -9,117 +9,66 @@ class NodeType(Enum):
     GROUND = "ground"
     CLIENT = "client"
 
-
 class Node:
     def __init__(
         self,
         node_id,
         node_type: NodeType,
-        position,
+        position, # For ground/clients: (lat, lon, alt). For Sats: TLE strings.
         power=1.0,
         noise_variance=1e-9,
         gradient_dim=100,
+        tle=None
     ):
         self.id = node_id
         self.type = node_type
-        self.position = np.array(position)
-
         self.power = power
         self.noise_variance = noise_variance
         self.gradient_dim = gradient_dim
+        
+        # Orbital handling
+        self.tle = tle
+        if self.tle:
+            self.sat_obj = EarthSatellite(tle[0], tle[1], node_id, load.timescale())
+        else:
+            self.position = np.array(position) # [lat, lon, alt]
 
-        # Channel-related cache
-        self.channels = {}   # {other_node_id: complex h}
-        self.latencies = {}  # {other_node_id: latency}
+        self.channels = {}
+        self.latencies = {}
 
-    def distance_to(self, other):
-        return np.linalg.norm(self.position - other.position)
+    def get_position_at(self, t_now):
+        """Returns 3D Cartesian coordinates (ITRS) at time t."""
+        if self.type == NodeType.SATELLITE:
+            geocentric = self.sat_obj.at(t_now)
+            return geocentric.position.km
+        return self.position # Simplified for ground nodes
 
-    def pathloss(self, other, alpha=2.0, fc=2.4e9):
+    def compute_doppler_shift(self, other, t_now, fc=2.4e9):
+        """Calculates Doppler shift based on relative velocity[cite: 61, 293]."""
         c = 3e8
-        d = self.distance_to(other) + 1e-6
-        return (c / (4 * np.pi * fc * d)) ** alpha
+        if self.type != NodeType.SATELLITE: return 0.0
+        
+        v_rel = np.linalg.norm(self.sat_obj.at(t_now).velocity.km_per_s)
+        # Using the formula: fD = (v_rel / c) * fc * cos(theta)
+        return (v_rel * 1000 / c) * fc 
 
-    # -----------------------------
-    # Channel generation (Rayleigh)
-    # -----------------------------
-    def generate_channel(self, other):
+    def get_channel(self, other, t_now):
+        """Generates time-varying channel with Doppler[cite: 61, 62]."""
+        pos_self = self.get_position_at(t_now)
+        pos_other = other.get_position_at(t_now)
+        dist = np.linalg.norm(pos_self - pos_other)
+        
+        # Pathloss with Doppler shift integration
+        f_d = self.compute_doppler_shift(other, t_now)
         fading = (np.random.randn() + 1j * np.random.randn()) / np.sqrt(2)
-        rho = self.pathloss(other)
-        h = rho * fading
-        self.channels[other.id] = h
+        
+        # Phase shift due to Doppler: e^{j2π fD t}
+        phase_shift = np.exp(1j * 2 * np.pi * f_d) 
+        rho = (3e8 / (4 * np.pi * 2.4e9 * (dist * 1000))) ** 2.0
+        
+        h = rho * fading * phase_shift
         return h
 
-    # -----------------------------
-    # Get channel (cached or new)
-    # -----------------------------
-    def get_channel(self, other):
-        if other.id not in self.channels:
-            return self.generate_channel(other)
-        return self.channels[other.id]
-
-    # -----------------------------
-    # Compute SNR to another node
-    # -----------------------------
-    def compute_snr_to(self, other):
-        """
-        Only valid if self is client (transmitter)
-        """
-        h = self.get_channel(other)
+    def compute_snr_to(self, other, t_now):
+        h = self.get_channel(other, t_now)
         return self.power * np.abs(h) ** 2 / self.noise_variance
-
-    # -----------------------------
-    # Latency model (simple)
-    # -----------------------------
-    def compute_latency_to(self, other, speed=3e8):
-        d = self.distance_to(other)
-        latency = d / speed
-        self.latencies[other.id] = latency
-        return latency
-
-    def get_latency_to(self, other):
-        if other.id not in self.latencies:
-            return self.compute_latency_to(other)
-        return self.latencies[other.id]
-
-
-def generate_nodes(
-    num_sats=3,
-    num_uavs=5,
-    num_ground=10,
-    num_clients=20,
-    area_size=2000,
-    gradient_dim=100
-) -> List[Node]:
-
-    nodes: List[Node] = []
-
-    # Satellites
-    for i in range(num_sats):
-        x, y = np.random.uniform(0, area_size, 2)
-        z = np.random.uniform(500, 2000)
-        nodes.append(Node(f"sat-{i}", NodeType.SATELLITE, (x, y, z), gradient_dim=gradient_dim))
-
-    # UAVs
-    for i in range(num_uavs):
-        x, y = np.random.uniform(0, area_size, 2)
-        z = np.random.uniform(20, 50)
-        nodes.append(Node(f"uav-{i}", NodeType.UAV, (x, y, z), gradient_dim=gradient_dim))
-
-    # Ground stations
-    for i in range(num_ground):
-        x, y = np.random.uniform(0, area_size, 2)
-        nodes.append(Node(f"gbs-{i}", NodeType.GROUND, (x, y, 0), gradient_dim=gradient_dim))
-
-    # Clients
-    for i in range(num_clients):
-        x, y = np.random.uniform(0, area_size, 2)
-        nodes.append(Node(
-            f"client-{i}",
-            NodeType.CLIENT,
-            (x, y, 0),
-            power=1.0,  # only clients transmit,
-            gradient_dim=gradient_dim
-        ))
-
-    return nodes

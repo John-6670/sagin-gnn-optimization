@@ -88,3 +88,6 @@ data/
 # results
 # =========================
 plots/
+
+# avoid zips
+*.zip
