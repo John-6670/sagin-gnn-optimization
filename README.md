@@ -1,10 +1,11 @@
 # SAGIN Placement & AirComp Simulation
 
-This repository provides an academic prototype for **Space-Air-Ground Integrated Networks (SAGIN)** with a focus on:
+This repository provides an academic prototype for **Space-Air-Ground Integrated Networks (SAGIN)** based on the paper:
 
 - Function-aware server placement  
 - Over-the-air aggregation (AirComp) modeling  
-- SNR-driven utility optimization  
+- SNR-driven utility optimization
+- Two Timescale Optimization
 
 The framework is designed to be modular and extensible, enabling gradual evolution toward more realistic channel models and learning-based optimization (e.g., GNN-guided placement).
 
@@ -15,13 +16,13 @@ The framework is designed to be modular and extensible, enabling gradual evoluti
 
 - `simulation/`  
   Core environment:
-  - `topology/` — Node abstraction (satellite, UAV, ground, client)
+  - `topology/` —  Node abstraction and hierarchical AirComp modeling (Satellite, UAV, Ground, Client)
   - `run_simulation.py` — main entry point for experiments
 
-- `optimization/`  
-  Placement and objective logic:
-  - Greedy server selection
-  - AMSE and utility computation
+- `optimization/` — Bilevel optimization logic:
+  - `placement.py` — Outer Loop (Slow timescale) server selection.
+  - `objective.py` — AMSE-aware utility and compound objective computation.
+  - `baselines.py` — Some baseline algorithms to compare with.
 
 - `graph/`  
   Graph construction and feature extraction (prepared for GNN integration)
@@ -39,6 +40,7 @@ source venv/bin/activate   # Linux / Mac
 venv\Scripts\activate      # Windows
 ```
 ### 2. Install dependencies
+Required libraries
 ```bash
 pip install -r requirements.txt
 ```
@@ -93,19 +95,31 @@ Controls placement and optimization:
 
 ## 🧠 Core Concepts
 
-### Node abstraction
+### Two-Timescale Optimization
 
-All entities are represented as a unified `Node` class:
+The framework utilizes a bilevel structure to handle network dynamics:
+1. **Outer Loop (Slow Timescale):** Adapts server placement to long-term orbital trajectories and load trends. (will be added in future)
+2. **Inner Loop (Fast Timescale):** Optimizes Over-the-Air control parameters (Power, Phase, Sync) to track instantaneous channel variations.
+
+### Node abstraction & Orbital Mechanics
+
+All entities are represented as a unified `Node` class. Satellites use **TLE (Two-Line Element)** data and the **SGP4** model for high-precision orbital propagation.
 - Satellite
 - UAV / HAP
 - Ground station
 - Client
 
-Each node includes:
-- 3D position
-- Channel model (Rayleigh + pathloss)
-- SNR computation
-- Latency estimation
+### Over-the-Air Computation (AirComp)
+Instead of digital aggregation, we exploit wireless superposition.
+- **AMSE-Aware Placement:** Servers are placed where channel geometry minimizes the AirComp Mean Squared Error.
+- **Hierarchical Aggregation:** Gradients flow from Clients → UAVs → Satellites → Gateways.
+
+### Placement Strategies
+- **Greedy (SNR-Aware):** Iteratively selects nodes based on marginal utility and SNR improvement.  
+- **LOP (Latency-Only):** Traditional facility location focusing solely on delay.  
+- **GO (Ground-Only):** Restricts placement to terrestrial infrastructure.  
+- **NRS (Non-Robust Static):** Deterministic placement using expected values without SNR thresholds.
+- **Random:** Randomly choose between available candiataes until either no more candidates exits or budget finishes.
 
 ### Objective Function
 Placement is guided by a compound objective:
@@ -116,43 +130,17 @@ where:
 - Latency depends on distance
 - AMSE depends on SNR and aggregation distortion
 
-### Greedy Placement
-Servers are selected iteratively based on:
-- Utility improvement
-- Deployment cost
-- SNR gain threshold
 
-### Lop Selection
-servers are selected iteratively based on total latency
-
-### Go Selection
-servers are selected like greedy algorithm just candidates are only ground stations.
-
-### Nrs Selection
-Servers are selected like greedy algorithm just without threshold.
-
-### Random Selection
-servers are selected randomly from candidates until either no more candidates exits or budget finishes.
-
-
-## 📊 Output
-Running a simulation prints:
+## 📊 Output & Metrics
+The simulation evaluates:
 - Total nodes and topology breakdown
 - Selected servers
 - Their types and positions
 
 
-## 📝 Notes
-- Channel model currently uses:
-   - Distance-based pathloss
-   - Rayleigh fading
-- SNR is precomputed per client-server pair
-- Utility is evaluated using AMSE-aware formulation
-
-
-## 🔮 Future Extensions
+## 🔮 Roadmap
 This framework is designed for incremental research development:
-- Multi-hop AirComp (client → UAV → satellite)
-- Time-varying SNR with Doppler effects
-- Distributionally robust optimization (DRO)
-- GNN-guided placement acceleration
+* ☑ Time-varying SNR with Doppler effects.
+* ☑ Hierarchical AirComp modeling.
+* ☐ GNN-guided placement acceleration.
+* ☐ Wasserstein Distributionally Robust Optimization (DRO).

@@ -2,6 +2,8 @@
 numpy
 pandas
 scipy
+matplotlib
+skyfield
 
 # Machine Learning
 torch
@@ -20,5 +22,3 @@ seaborn
 
 # Config / experiments
 pyyaml
-
-skyfield

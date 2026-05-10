@@ -4,10 +4,13 @@ from simulation.topology.nodes import Node
 
 
 # AMSE(k, n)
-def compute_amse_kn(client: Node, server: Node, delta_list):
-    snr = client.compute_snr_to(server)
+def compute_amse_kn(client: Node, server: Node, delta_list, t_now=None):
+    if t_now is not None:
+        snr = client.compute_snr_to(server, t_now)
+    else:
+        snr = client.compute_snr_to(server)
 
-    if snr <= 1e-12:
+    if snr <= 0.0:
         return float("inf")
 
     cascaded_error = np.prod([1 + d for d in delta_list])

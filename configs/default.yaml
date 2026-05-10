@@ -1,16 +1,22 @@
 simulation:
-  num_sats: 3
-  num_uavs: 5
-  num_ground: 10
-  num_clients: 20
+  num_sats: 9
+  num_uavs: 15
+  num_ground: 30
+  num_clients: 60
   area_size: 2000
   gradient_dim: 100
   sigma2: 10
   algorithm: test
 
+  # Dynamic Simulation Parameters
+  duration_hours: 0.5       # Total simulation time
+  time_step_seconds: 10       # Inner loop execution frequency (Fast timescale)
+  outer_interval_minutes: 30  # Outer loop execution frequency (Slow timescale)
+
 algorithm:
   alpha: 0.5
   beta: 0.5
-  budget: 10
+  budget: 20
   delta_list: [0.1, 0.2]
   snr_threshold: 0.0
+  target_snr: 10.0          # Used by the Inner Loop power control
