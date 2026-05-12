@@ -1,34 +1,25 @@
 from abc import ABC, abstractmethod
-import numpy as np
+from simulation.network.channel_model import SaginChannelModel
 
 
 class NetworkModel(ABC):
-    """Abstract network model for SAGIN link metrics."""
-
     @abstractmethod
-    def snr(self, node1, node2):
+    def snr(self, node1, node2, t_now=None):
         raise NotImplementedError
 
     @abstractmethod
-    def latency(self, node1, node2):
+    def latency(self, node1, node2, t_now=None):
         raise NotImplementedError
 
 
-class SimplePathLossModel(NetworkModel):
-    """Simplified path-loss model for early prototyping."""
+class PathLossModel(NetworkModel):
+    """Backward-compatible wrapper now delegating to the realistic SAGIN model."""
 
-    def __init__(self, noise_power: float = 1e-3, pathloss_exp: float = 2.0, tx_power: float = 1.0):
-        self.noise_power = noise_power
-        self.pathloss_exp = pathloss_exp
-        self.tx_power = tx_power
+    def __init__(self):
+        self.model = SaginChannelModel()
 
-    def _distance(self, node1, node2) -> float:
-        return float(np.linalg.norm(node1.position - node2.position))
+    def snr(self, node1, node2, t_now=None):
+        return self.model.snr(node1, node2, t_now)
 
-    def snr(self, node1, node2) -> float:
-        d = max(self._distance(node1, node2), 1e-3)
-        return self.tx_power * (d**-self.pathloss_exp) / self.noise_power
-
-    def latency(self, node1, node2) -> float:
-        d = self._distance(node1, node2)
-        return d / 3e5
+    def latency(self, node1, node2, t_now=None):
+        return node1.get_latency_to(node2, t_now)
