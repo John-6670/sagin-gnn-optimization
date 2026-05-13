@@ -1,6 +1,6 @@
 import random
 
-from optimization.placement import greedy_server_selection
+from optimization.placement import greedy_server_selection, dr_greedy_server_selection
 from simulation.topology.nodes import NodeType
 
 
@@ -61,3 +61,18 @@ def nrs_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_
 
 def random_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list):
     return random.sample(candidates, min(budget, len(candidates)))
+
+
+def dr_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, t_now=None, **kwargs):
+    return dr_greedy_server_selection(
+        candidates=candidates,
+        clients=clients,
+        budget=budget,
+        cost=cost,
+        thresh=thresh,
+        alpha=alpha,
+        beta=beta,
+        delta_list=delta_list,
+        t_now=t_now,
+        **kwargs,
+    )

@@ -9,7 +9,7 @@ simulation:
   algorithm: test
 
   # Dynamic Simulation Parameters
-  duration_hours: 0.5       # Total simulation time
+  duration_hours: 0.5         # Total simulation time
   time_step_seconds: 10       # Inner loop execution frequency (Fast timescale)
   outer_interval_minutes: 30  # Outer loop execution frequency (Slow timescale)
 
@@ -17,6 +17,12 @@ algorithm:
   alpha: 0.5
   beta: 0.5
   budget: 20
-  delta_list: [0.1, 0.2]
+  delta_list:
+    - 0.1
+    - 0.2
   snr_threshold: 0.0
   target_snr: 10.0          # Used by the Inner Loop power control
+
+gnn:
+  checkpoint: checkpoints/sagin_hgnn.pt
+  kappa: 0.15

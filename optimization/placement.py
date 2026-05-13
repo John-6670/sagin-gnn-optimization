@@ -3,6 +3,7 @@ from typing import List, Dict
 
 from simulation.topology.nodes import Node
 from optimization.objective import compute_utility
+from optimization.dro import ScenarioBundle, sample_snr_scenarios, robust_marginal_gain, local_one_swap
 
 
 def predictive_ota_control(selected_servers: List[Node], clients: List[Node], t_now, target_snr=10.0) -> Dict:
@@ -117,4 +118,44 @@ def greedy_server_selection(
 
         candidates_cp.remove(best_server)
         
+    return S
+
+
+def _gnn_prune_candidates(candidates, clients, kappa=0.15, checkpoint=None):
+    try:
+        from models.gnn.train import load_gnn_for_inference, predict_candidate_scores
+        model = load_gnn_for_inference(checkpoint)
+        scored = predict_candidate_scores(model, candidates, clients)
+        keep = max(1, int(np.ceil(kappa * len(candidates))))
+        return [c for c, _ in sorted(scored.items(), key=lambda kv: kv[1], reverse=True)[:keep]]
+    except Exception:
+        return candidates
+
+
+def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, t_now=None,
+                                epsilon=0.1, alpha_cvar=0.9, N=64, coherence_time=25.0, sigma_snr=0.35,
+                                gnn_checkpoint=None, kappa=0.15):
+    C = _gnn_prune_candidates(candidates, clients, kappa=kappa, checkpoint=gnn_checkpoint)
+    scenario_maps = sample_snr_scenarios(clients, C, t_now, N=N, coherence_time=coherence_time, sigma_snr=sigma_snr)
+    bundle = ScenarioBundle(scenarios=scenario_maps, clients=clients, candidates=C, delta_list=delta_list, alpha=alpha, beta=beta)
+
+    S = []
+    total_cost = 0.0
+    remaining = list(C)
+    while remaining:
+        best_v, best_score = None, -float('inf')
+        for v in remaining:
+            if total_cost + cost[v] > budget:
+                continue
+            score, _ = robust_marginal_gain(S, v, bundle, epsilon=epsilon, alpha_cvar=alpha_cvar)
+            if score > best_score:
+                best_score, best_v = score, v
+
+        if best_v is None or best_score <= thresh:
+            break
+        S.append(best_v)
+        total_cost += cost[best_v]
+        remaining.remove(best_v)
+
+    S = local_one_swap(S, C, budget, cost, bundle, epsilon=epsilon, alpha_cvar=alpha_cvar)
     return S
