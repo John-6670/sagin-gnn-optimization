@@ -47,7 +47,6 @@ Makefile
 # =========================
 
 checkpoints/
-models/
 logs/
 runs/
 outputs/
