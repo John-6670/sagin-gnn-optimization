@@ -10,6 +10,7 @@ from skyfield.api import load, utc
 from simulation.config_loader import load_config
 from simulation.topology.nodes import Node, NodeType, generate_nodes
 from simulation.topology.aircomp import compute_amse_kn, compute_amse_n
+from simulation.topology.patching import hybrid_patch
 from optimization.placement import greedy_server_selection, predictive_ota_control
 from optimization.baselines import lop_selection, go_selection, nrs_selection, random_selection
 
@@ -183,9 +184,10 @@ def compute_ota_metrics(selected_servers, clients, target_snr, delta_list, sigma
     amse_kn_avg = {}
     amse_kn_min = {}
     amse_kn_max = {}
+    amse_hybrid_n = {}
 
     if not selected_servers:
-        return amse_n, amse_kn_avg, amse_kn_min, amse_kn_max
+        return amse_n, amse_kn_avg, amse_kn_min, amse_kn_max, amse_hybrid_n
 
     cascaded_error = np.prod([1 + d for d in delta_list])
     for n in selected_servers:
@@ -210,12 +212,14 @@ def compute_ota_metrics(selected_servers, clients, target_snr, delta_list, sigma
             client_amse_values.append(amse_kn_val)
 
         amse_n[n] = compute_amse_n(snr_dic, sigma2, gradient_dim)
+        _, hybrid_bound, _ = hybrid_patch(clients, n, {c: {n: snr_dic[c]} for c in clients}, delta_list, num_bits=8)
+        amse_hybrid_n[n] = hybrid_bound
         if client_amse_values:
             amse_kn_avg[n] = np.mean(client_amse_values)
             amse_kn_min[n] = min(client_amse_values)
             amse_kn_max[n] = max(client_amse_values)
 
-    return amse_n, amse_kn_avg, amse_kn_min, amse_kn_max
+    return amse_n, amse_kn_avg, amse_kn_min, amse_kn_max, amse_hybrid_n
 
 
 def plot_comparison_amse_n(total_amse_n, output_dir="plots"):
@@ -408,7 +412,7 @@ def main():
             print(summarize_selection(selected_servers))
 
             if alg == 'test':
-                amse_n, amse_kn_avg, amse_kn_min, amse_kn_max = compute_ota_metrics(
+                amse_n, amse_kn_avg, amse_kn_min, amse_kn_max, amse_hybrid_n = compute_ota_metrics(
                     selected_servers,
                     clients,
                     target_snr,
