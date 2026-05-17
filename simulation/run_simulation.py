@@ -13,6 +13,9 @@ from simulation.topology.aircomp import compute_amse_kn, compute_amse_n
 from simulation.topology.patching import hybrid_patch
 from optimization.placement import greedy_server_selection, predictive_ota_control
 from optimization.baselines import lop_selection, go_selection, nrs_selection, random_selection
+from fl.tasks import get_task_registry
+from fl.trainer import FederatedRound
+from fl.convergence import convergence_monitor
 
 
 def parse_args():
@@ -21,6 +24,7 @@ def parse_args():
     parser.add_argument("--budget", type=int, default=None)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--algorithm", type=str, default=None, help="Override algorithm (e.g., 'all', 'test', 'greedy')")
+    parser.add_argument("--fl", action="store_true", help="Run FL experiments")
     return parser.parse_args()
 
 
@@ -331,6 +335,47 @@ def plot_comparison_amse_kn(total_avg, total_min, total_max, output_dir="plots")
     plt.close(fig)
 
 
+def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots"):
+    os.makedirs(output_dir, exist_ok=True)
+    tasks = get_task_registry()
+    for task_name, task in tasks.items():
+        print(f"[FL] task={task_name}")
+        client_loaders, test_loader=task.get_data_loaders(len(clients), seed=123)
+        
+        for alg_name, algo in algorithms.items():
+            selected=algo(
+                candidates=candidates, clients=clients, budget=budget, cost=cost,
+                thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list
+            )
+            if not selected:
+                continue
+            
+            model = task.get_model()
+            amse_hist = []
+            loss_hist = []
+            acc_hist = []
+            for r in range(12):
+                snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in clients}
+                res = FederatedRound(r, clients, selected, {}, task, model, client_loaders, test_loader, snr_map, delta_list, use_hybrid=True)
+                amse_hist.append(res['amse'])
+                loss_hist.append(res['loss'])
+                acc_hist.append(res['accuracy'])
+            
+            _, logs = convergence_monitor(amse_hist, loss_hist, sigma2=1.0, rho=0.95, gamma=0.5)
+            x = np.arange(1, len(acc_hist)+1)
+            fig, ax = plt.subplots(figsize=(8,4))
+            ax.plot(x, acc_hist, label='accuracy')
+            ax2 = ax.twinx()
+            ax2.plot(x, [l['theoretical_bound'] for l in logs], color='r', label='bound')
+            ax.set_title(f"FL {task_name} - {alg_name}")
+            ax.set_xlabel('round')
+            ax.set_ylabel('acc')
+            ax2.set_ylabel('bound')
+            fig.tight_layout()
+            fig.savefig(os.path.join(output_dir, f"fl_{task_name}_{alg_name}.png"), dpi=200)
+            plt.close(fig)
+
+
 def main():
     args = parse_args()
     config = load_config(args.config)
@@ -385,6 +430,9 @@ def main():
     g_can = len([n for n in candidates if n.type == NodeType.GROUND])
 
     cost = build_costs(candidates)
+    
+    if args.fl:
+        run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots")
 
     if alg in ['all', 'test']:
         total_amse_n = {}

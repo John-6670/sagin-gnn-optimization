@@ -40,6 +40,9 @@ class Node:
         return 0.0 if t_now is None else float(getattr(t_now, "tt", 0.0) * 86400.0)
 
     def get_position_at(self, t_now):
+        if t_now is None:
+            t_now = TS.now()
+        
         if self.sat_obj is not None:
             geocentric = self.sat_obj.at(t_now)
             return geocentric.position.km
@@ -59,8 +62,12 @@ class Node:
         return ground_xyz
 
     def get_velocity_at(self, t_now):
+        if t_now is None:
+            t_now = TS.now()
+        
         if self.sat_obj is not None:
             return self.sat_obj.at(t_now).velocity.km_per_s
+        
         return np.zeros(3)
     
     def get_channel(self, other, t_now=None):
