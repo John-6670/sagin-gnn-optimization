@@ -11,8 +11,11 @@ from simulation.config_loader import load_config
 from simulation.topology.nodes import Node, NodeType, generate_nodes
 from simulation.topology.aircomp import compute_amse_kn, compute_amse_n
 from simulation.topology.patching import hybrid_patch
+from simulation.traffic.traffic_generator import generate_spatiotemporal_traffic
+from simulation.environment.weather import TwoStateWeatherMarkov
+from simulation.evaluation.metrics import compute_e2e_latency, compute_total_energy, compute_cvar
 from optimization.placement import greedy_server_selection, predictive_ota_control
-from optimization.baselines import lop_selection, go_selection, nrs_selection, random_selection
+from optimization.baselines import lop_selection, go_selection, nrs_selection, random_selection, dr_selection
 from fl.tasks import get_task_registry
 from fl.trainer import FederatedRound
 from fl.convergence import convergence_monitor
@@ -229,7 +232,8 @@ def compute_ota_metrics(selected_servers, clients, target_snr, delta_list, sigma
 def plot_comparison_amse_n(total_amse_n, output_dir="plots"):
     """
     Compares all algorithms together for AMSE_n.
-    X-axis represents algorithms; Y-axis is the SUM or MEAN of AMSE across selected servers.
+    X-axis represents algorithms
+    Y-axis is the SUM or MEAN of AMSE across selected servers.
     """
     os.makedirs(output_dir, exist_ok=True)
     
@@ -340,12 +344,11 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
     tasks = get_task_registry()
     for task_name, task in tasks.items():
         print(f"[FL] task={task_name}")
-        client_loaders, test_loader=task.get_data_loaders(len(clients), seed=123)
-        
+        client_loaders, test_loader = task.get_data_loaders(len(clients), seed=123)
         for alg_name, algo in algorithms.items():
-            selected=algo(
-                candidates=candidates, clients=clients, budget=budget, cost=cost,
-                thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list
+            selected = algo(
+                candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+                alpha=alpha, beta=beta, delta_list=delta_list
             )
             if not selected:
                 continue
@@ -356,7 +359,10 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
             acc_hist = []
             for r in range(12):
                 snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in clients}
-                res = FederatedRound(r, clients, selected, {}, task, model, client_loaders, test_loader, snr_map, delta_list, use_hybrid=True)
+                res = FederatedRound(
+                    r, clients, selected, {}, task, model, client_loaders,
+                    test_loader, snr_map, delta_list, use_hybrid=True
+                )
                 amse_hist.append(res['amse'])
                 loss_hist.append(res['loss'])
                 acc_hist.append(res['accuracy'])
@@ -371,9 +377,63 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
             ax.set_xlabel('round')
             ax.set_ylabel('acc')
             ax2.set_ylabel('bound')
+            plt.legend()
+            fig.legend()
             fig.tight_layout()
             fig.savefig(os.path.join(output_dir, f"fl_{task_name}_{alg_name}.png"), dpi=200)
             plt.close(fig)
+
+
+def run_full_sweep(
+    algorithms, nodes, clients, candidates, budget, cost, thresh, alpha, beta, delta_list,
+    duration_hours, time_step_seconds, outer_interval_minutes, target_snr
+):
+    os.makedirs("results", exist_ok=True)
+    ts = load.timescale()
+    start = ts.now()
+    weather = TwoStateWeatherMarkov(dt_seconds=time_step_seconds)
+    for name, algo in algorithms.items():
+        rows = []
+        selected = algo(
+            candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+            alpha=alpha, beta=beta, delta_list=delta_list
+        )
+        total_steps = int((duration_hours*3600)//time_step_seconds)
+        for step in range(total_steps):
+            t_now = start + (step*time_step_seconds)/86400.0
+            traffic = generate_spatiotemporal_traffic(clients, t_now)
+            for c in clients:
+                c.load = float(traffic.get(c.id,0.0))
+            
+            loss_db = weather.atmospheric_loss_db()
+            weather.step()
+            for n in nodes:
+                if hasattr(n,'channel_model'):
+                    n.channel_model.set_weather_loss_db(loss_db)
+            
+            ota = predictive_ota_control(selected, clients, t_now, target_snr)
+            amse_vals = []
+            for s in selected:
+                snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
+                amse_vals.append(compute_amse_n(snr_dic, sigma2=10, d=100))
+            
+            lat = compute_e2e_latency(clients, selected, t_now)
+            energy = compute_total_energy(clients, ota, transmission_time=time_step_seconds)
+            amse = float(np.mean(amse_vals)) if amse_vals else 0.0
+            rows.append((step, lat, amse, energy))
+            if (step*time_step_seconds)%(outer_interval_minutes*60) == 0 and step > 0:
+                selected = algo(
+                    candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+                    alpha=alpha, beta=beta, delta_list=delta_list
+                )
+        
+        losses = [r[2] for r in rows]
+        cvar = compute_cvar(losses, alpha=0.05)
+        csv_path = f"results/{name}_metrics.csv"
+        with open(csv_path,'w') as f:
+            f.write('step,latency,amse,energy,cvar5\n')
+            for r in rows:
+                f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{cvar}\n")
 
 
 def main():
@@ -406,6 +466,7 @@ def main():
 
     algorithms = {
         "greedy": greedy_server_selection,
+        "dr_greedy": dr_selection,
         "lop": lop_selection,
         "go": go_selection,
         "nrs": nrs_selection,
