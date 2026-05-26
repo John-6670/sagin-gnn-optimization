@@ -1,10 +1,13 @@
 from __future__ import annotations
-import copy, math
+import copy
+import logging
 import numpy as np
 import torch
 from simulation.topology.patching import hybrid_patch, aircomp_aggregate
 
 from .device import DEVICE
+
+log = logging.getLogger("fl.trainer")
 
 
 def _eval(model, test_loader, criterion):
@@ -34,13 +37,13 @@ def FederatedRound(
     round_idx, clients, servers, ota_params, task, global_model,
     client_loaders, test_loader, snr_map, delta_list, use_hybrid=True
 ):
-    p_t = 0.1 + 0.3 * math.sin(2*math.pi*round_idx/24.0)
-    p_t = float(np.clip(p_t, 0.01, 0.95))
-    active = [i for i in range(len(clients)) if np.random.rand() < p_t]
-    if not active:
-        active = [np.random.randint(0, len(clients))]
+    p_t = 1.0
+    active = list(range(len(clients)))
 
-    grads=[]
+    log.debug("  Round %d: all clients active (%d/%d)",
+              round_idx, len(active), len(clients))
+
+    grads = []
     for cid in active:
         local = copy.deepcopy(global_model).to(DEVICE)
         if task.optimizer == 'sgd':
@@ -49,41 +52,55 @@ def FederatedRound(
             opt = torch.optim.Adam(local.parameters(), lr=task.lr, **task.optimizer_kwargs)
         else:
             raise ValueError(f"Unknown optimizer {task.optimizer}")
-        
+
         local.train()
-        for _ in range(task.local_epochs):
+        epoch_losses = []
+        for epoch in range(task.local_epochs):
+            batch_loss = 0.0
+            n_batches = 0
             for xb, yb in client_loaders[cid]:
                 xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                
                 opt.zero_grad()
                 out = local(xb)
-                loss = task.criterion(out,yb)
+                loss = task.criterion(out, yb)
                 loss.backward()
-                
                 if task.grad_clip is not None:
                     torch.nn.utils.clip_grad_norm_(local.parameters(), task.grad_clip)
                 opt.step()
-        
-        diff=[]
+                batch_loss += loss.item()
+                n_batches += 1
+            epoch_losses.append(batch_loss / max(n_batches, 1))
+        log.debug("    client %d: epoch losses %s", cid, [f"{l:.4f}" for l in epoch_losses])
+
+        diff = []
         for pg, pl in zip(global_model.parameters(), local.parameters()):
             diff.append((pg.data - pl.data).flatten())
-        grads.append(torch.cat(diff).detach().cpu().numpy())
+        grad_vec = torch.cat(diff).detach().cpu().numpy()
+        log.debug("    client %d: grad norm=%.6f", cid, float(np.linalg.norm(grad_vec)))
+        grads.append(grad_vec)
 
+    log.debug("  Round %d: aggregating %d gradients (use_hybrid=%s)...", round_idx, len(grads), use_hybrid)
     if use_hybrid:
         _, amse_round, meta = hybrid_patch([clients[i] for i in active], servers[0], snr_map, delta_list)
         w = np.array([meta['w_a'], meta['w_d']])
-        g = np.mean(grads, axis=0)*w.sum()
+        g = np.mean(grads, axis=0) * w.sum()
+        log.debug("  Round %d: hybrid_patch amse=%.6f  w_a=%.4f  w_d=%.4f  w_sum=%.4f",
+                  round_idx, amse_round, meta['w_a'], meta['w_d'], w.sum())
     else:
         g, amse_round, _, _ = aircomp_aggregate([clients[i] for i in active], servers[0], snr_map, delta_list)
+        log.debug("  Round %d: aircomp amse=%.6f", round_idx, amse_round)
 
+    log.debug("  Round %d: applying global model update (grad norm=%.6f)...",
+              round_idx, float(np.linalg.norm(g)))
     ptr = 0
     for p in global_model.parameters():
         n = p.numel()
         upd = torch.tensor(g[ptr:ptr+n], dtype=p.dtype, device=DEVICE).view_as(p)
-        p.data -= task.lr * upd
+        p.data -= task.server_lr * upd
         ptr += n
 
     loss, acc = _eval(global_model, test_loader, task.criterion)
+    log.debug("  Round %d: eval complete — loss=%.6f  acc=%.4f", round_idx, loss, acc)
     return {
         'round': round_idx,
         'active_clients': len(active),

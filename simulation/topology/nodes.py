@@ -97,22 +97,35 @@ def generate_nodes(num_sats, num_uavs, num_ground, num_clients, area_size, gradi
         lon = np.random.uniform(-side_deg / 2.0, side_deg / 2.0)
         return np.array([lat, lon, alt_km])
 
+    # Power levels and noise are sized so that Friis free-space SNR is in a
+    # meaningful range at SAGIN distances (10–1000 km).
+    # noise_variance ≈ thermal noise power: kTB at 20 MHz ≈ 8e-14 W → use 1e-13 W.
+    THERMAL_NOISE = 1e-13  # W  (kTB at 290 K, 20 MHz)
+
     # Generate satellites
     for i in range(num_sats):
         tle = tle_list[i] if tle_list is not None and i < len(tle_list) else None
         pos = rand_lat_lon_alt(550.0)
-        nodes.append(Node(i, NodeType.SATELLITE, pos, gradient_dim=gradient_dim, tle=tle))
-    
+        nodes.append(Node(i, NodeType.SATELLITE, pos,
+                          power=500.0, noise_variance=THERMAL_NOISE,
+                          gradient_dim=gradient_dim, tle=tle))
+
     # Generate UAVs
     for i in range(num_sats, num_sats + num_uavs):
-        nodes.append(Node(i, NodeType.UAV, rand_lat_lon_alt(20.0), gradient_dim=gradient_dim))
-    
+        nodes.append(Node(i, NodeType.UAV, rand_lat_lon_alt(20.0),
+                          power=10.0, noise_variance=THERMAL_NOISE,
+                          gradient_dim=gradient_dim))
+
     # Generate ground stations
     for i in range(num_sats + num_uavs, num_sats + num_uavs + num_ground):
-        nodes.append(Node(i, NodeType.GROUND, rand_lat_lon_alt(0.1), gradient_dim=gradient_dim))
-    
+        nodes.append(Node(i, NodeType.GROUND, rand_lat_lon_alt(0.1),
+                          power=10.0, noise_variance=THERMAL_NOISE,
+                          gradient_dim=gradient_dim))
+
     # Generate clients
     for i in range(num_sats + num_uavs + num_ground, num_sats + num_uavs + num_ground + num_clients):
-        nodes.append(Node(i, NodeType.CLIENT, rand_lat_lon_alt(0.1), gradient_dim=gradient_dim))
+        nodes.append(Node(i, NodeType.CLIENT, rand_lat_lon_alt(0.1),
+                          power=0.1, noise_variance=THERMAL_NOISE,
+                          gradient_dim=gradient_dim))
     
     return nodes

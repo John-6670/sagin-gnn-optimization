@@ -90,3 +90,5 @@ plots/
 
 # avoid zips
 *.zip
+
+data/

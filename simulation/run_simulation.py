@@ -4,10 +4,21 @@ from collections import defaultdict
 import numpy as np
 from matplotlib import pyplot as plt
 import os
+import logging
 from datetime import datetime
 from skyfield.api import load, utc
 
 from simulation.config_loader import load_config
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Suppress noisy third-party loggers
+for _noisy in ("PIL", "matplotlib", "urllib3", "filelock"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+log = logging.getLogger("run_simulation")
 from simulation.topology.nodes import Node, NodeType, generate_nodes
 from simulation.topology.aircomp import compute_amse_kn, compute_amse_n
 from simulation.topology.patching import hybrid_patch
@@ -28,6 +39,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--algorithm", type=str, default=None, help="Override algorithm (e.g., 'all', 'test', 'greedy')")
     parser.add_argument("--fl", action="store_true", help="Run FL experiments")
+    parser.add_argument("--task", type=str, default=None, help="FL task to run (e.g. 'reddit_nwp', 'cifar10', 'iot_anomaly'). Runs all if omitted.")
     return parser.parse_args()
 
 
@@ -339,26 +351,48 @@ def plot_comparison_amse_kn(total_avg, total_min, total_max, output_dir="plots")
     plt.close(fig)
 
 
-def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots"):
+def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots", task_filter=None):
     os.makedirs(output_dir, exist_ok=True)
-    tasks = get_task_registry()
+    all_tasks = get_task_registry()
+    if task_filter:
+        if task_filter not in all_tasks:
+            raise ValueError(f"Unknown task '{task_filter}'. Available: {list(all_tasks.keys())}")
+        tasks = {task_filter: all_tasks[task_filter]}
+    else:
+        tasks = all_tasks
+    log.info("=== FL Experiments START | tasks=%s | algorithms=%s | clients=%d | candidates=%d | budget=%d ===",
+             list(tasks.keys()), list(algorithms.keys()), len(clients), len(candidates), budget)
     for task_name, task in tasks.items():
-        print(f"[FL] task={task_name}")
+        log.info("--- FL Task: %s | local_epochs=%d | lr=%s | optimizer=%s ---",
+                 task_name, task.local_epochs, task.lr, task.optimizer)
+        log.debug("  Loading data loaders for %d clients (seed=123)...", len(clients))
         client_loaders, test_loader = task.get_data_loaders(len(clients), seed=123)
+        log.debug("  Data loaders ready.")
         for alg_name, algo in algorithms.items():
+            log.info("  [%s / %s] Running server selection...", task_name, alg_name)
             selected = algo(
                 candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
                 alpha=alpha, beta=beta, delta_list=delta_list
             )
             if not selected:
+                log.warning("  [%s / %s] No servers selected — skipping.", task_name, alg_name)
                 continue
-            
+            log.info("  [%s / %s] Selected %d server(s): %s",
+                     task_name, alg_name, len(selected),
+                     [(s.id, s.type.value) for s in selected])
+
             model = task.get_model()
+            log.debug("  [%s / %s] Model built: %s", task_name, alg_name, type(model).__name__)
             amse_hist = []
             loss_hist = []
             acc_hist = []
-            for r in range(12):
+            num_rounds = 12
+            for r in range(num_rounds):
+                log.info("  [%s / %s] Round %2d/%d — computing SNR map...", task_name, alg_name, r+1, num_rounds)
                 snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in clients}
+                snr_vals = [list(v.values())[0] for v in snr_map.values()]
+                log.debug("    SNR stats: min=%.3e  max=%.3e  mean=%.3e",
+                          min(snr_vals), max(snr_vals), float(np.mean(snr_vals)))
                 res = FederatedRound(
                     r, clients, selected, {}, task, model, client_loaders,
                     test_loader, snr_map, delta_list, use_hybrid=True
@@ -366,8 +400,12 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
                 amse_hist.append(res['amse'])
                 loss_hist.append(res['loss'])
                 acc_hist.append(res['accuracy'])
-            
+                log.info("    Round %2d result: active=%d  p_t=%.3f  amse=%.6f  loss=%.6f  acc=%.4f",
+                         r+1, res['active_clients'], res['p_t'], res['amse'], res['loss'], res['accuracy'])
+
             _, logs = convergence_monitor(amse_hist, loss_hist, sigma2=1.0, rho=0.95, gamma=0.5)
+            log.info("  [%s / %s] Convergence summary — final bound=%.6f  final acc=%.4f  final loss=%.6f",
+                     task_name, alg_name, logs[-1]['theoretical_bound'], acc_hist[-1], loss_hist[-1])
             x = np.arange(1, len(acc_hist)+1)
             fig, ax = plt.subplots(figsize=(8,4))
             ax.plot(x, acc_hist, label='accuracy')
@@ -380,8 +418,11 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
             plt.legend()
             fig.legend()
             fig.tight_layout()
-            fig.savefig(os.path.join(output_dir, f"fl_{task_name}_{alg_name}.png"), dpi=200)
+            plot_path = os.path.join(output_dir, f"fl_{task_name}_{alg_name}.png")
+            fig.savefig(plot_path, dpi=200)
             plt.close(fig)
+            log.info("  [%s / %s] Plot saved: %s", task_name, alg_name, plot_path)
+    log.info("=== FL Experiments DONE ===")
 
 
 def run_full_sweep(
@@ -438,7 +479,11 @@ def run_full_sweep(
 
 def main():
     args = parse_args()
+    log.info("=== SAGIN Simulation START ===")
+    log.info("Args: config=%s  algorithm=%s  fl=%s  seed=%s  budget=%s",
+             args.config, args.algorithm, args.fl, args.seed, args.budget)
     config = load_config(args.config)
+    log.info("Config loaded from %s", args.config)
 
     num_sats = config["simulation"].get("num_sats", 1)
     num_uavs = config["simulation"].get("num_uavs", 2)
@@ -473,9 +518,16 @@ def main():
         "random": random_selection,
     }
 
+    log.info("Simulation params: sats=%d  uavs=%d  ground=%d  clients=%d  area=%d  gradient_dim=%d  sigma2=%s",
+             num_sats, num_uavs, num_ground, num_clients, area_size, gradient_dim, sigma2)
+    log.info("Algorithm params: alg=%s  budget=%d  alpha=%s  beta=%s  thresh=%s  target_snr=%s  delta_list=%s",
+             alg, budget, alpha, beta, thresh, target_snr, delta_list)
+
     if args.seed is not None:
         np.random.seed(args.seed)
+        log.info("Random seed set to %d", args.seed)
 
+    log.info("Generating nodes...")
     nodes = generate_nodes(
         num_sats=num_sats,
         num_uavs=num_uavs,
@@ -489,11 +541,18 @@ def main():
     candidates = [n for n in nodes if n.type != NodeType.CLIENT]
     n_can = len(candidates)
     g_can = len([n for n in candidates if n.type == NodeType.GROUND])
+    log.info("Nodes generated: total=%d  clients=%d  candidates=%d  (sats=%d  uavs=%d  ground=%d)",
+             len(nodes), len(clients), n_can,
+             sum(1 for n in candidates if n.type == NodeType.SATELLITE),
+             sum(1 for n in candidates if n.type == NodeType.UAV),
+             g_can)
 
     cost = build_costs(candidates)
-    
+    log.debug("Costs built: %s", {n.id: c for n, c in cost.items()})
+
     if args.fl:
-        run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots")
+        log.info("--- FL flag set: launching run_fl_experiments ---")
+        run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots", task_filter=args.task)
 
     if alg in ['all', 'test']:
         total_amse_n = {}
@@ -637,7 +696,7 @@ def main():
 
     else:
         algo = algorithms[alg]
-        print(f'begin algorithm {alg}', flush=True)
+        log.info("--- Running single algorithm: %s ---", alg)
         selected_servers = algo(
             candidates=candidates,
             clients=clients,
@@ -648,6 +707,9 @@ def main():
             beta=beta,
             delta_list=delta_list
         )
+        log.info("Algorithm %s selected %d server(s):", alg, len(selected_servers))
+        for s in selected_servers:
+            log.info("  server=%s  type=%s  pos=%s", s.id, s.type.value, s.position.tolist())
         print(f'--- Algorithm {alg} Summary ---')
         print(f"Area size: {area_size} x {area_size}")
         print(f"Total nodes: {len(nodes)}")
@@ -655,6 +717,7 @@ def main():
         print(f"Alpha={alpha}, Beta={beta}")
         print(f"Budget: {budget}")
         print(summarize_selection(selected_servers))
+    log.info("=== SAGIN Simulation END ===")
 
 
 if __name__ == "__main__":

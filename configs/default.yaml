@@ -2,7 +2,7 @@ simulation:
   num_sats: 5
   num_uavs: 3
   num_ground: 4
-  num_clients: 20
+  num_clients: 5
   area_size: 2000
   gradient_dim: 100
   sigma2: 10

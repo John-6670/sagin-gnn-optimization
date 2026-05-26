@@ -144,3 +144,15 @@ This framework is designed for incremental research development:
 * ☑ Hierarchical AirComp modeling.
 * ☐ GNN-guided placement acceleration.
 * ☐ Wasserstein Distributionally Robust Optimization (DRO).
+
+## GPU Usage
+
+- You can force the code to use the GPU by setting the environment variable `FORCE_CUDA` to `1`, `true`, or `yes` before running. Example:
+
+```bash
+FORCE_CUDA=1 python -m simulation.run_simulation --config configs/default.yaml --algorithm greedy
+
+FORCE_CUDA=1 python -m simulation.run_simulation --config configs/default.yaml --algorithm greedy --fl --seed 1
+```
+
+Note: forcing CUDA when no GPU or CUDA drivers are available will raise an error from PyTorch.

@@ -81,11 +81,18 @@ class SaginChannelModel:
                 loss_lin = 10 ** (-self._atmospheric_loss_db() / 10.0)
                 rho *= loss_lin
             return rho
-        if link_type == LinkType.HAP_GROUND:
-            pl_db = 128.1 + 37.6 * np.log10(max(d_km, 1e-6))
+        # For HAP_GROUND and GROUND_GROUND: use Friis free-space amplitude gain.
+        # Prior code returned 10^(-pl_db/10) which is a *power* gain, but
+        # channel_coefficient squares rho to get |h|^2, so it must be an amplitude.
+        # Hata path loss (designed for <20 km cells) is also inappropriate for SAGIN
+        # distances (tens to hundreds of km); free-space is more suitable.
+        if link_type == LinkType.GROUND_GROUND:
+            # Terrestrial: apply extra 20 dB shadowing penalty relative to free-space
+            shadow_factor = 0.1
         else:
-            pl_db = 46.3 + 33.9 * np.log10(self.fc / 1e6) - 13.82 * np.log10(30.0) + (44.9 - 6.55 * np.log10(30.0)) * np.log10(max(d_km, 1e-6))
-        return 10 ** (-pl_db / 10.0)
+            shadow_factor = 1.0
+        rho = shadow_factor * C_MPS / (4.0 * np.pi * self.fc * d_m)
+        return rho
 
     def _rician_or_rayleigh(self, link_type: LinkType) -> complex:
         k_db = self.link_params[link_type].k_db
