@@ -40,6 +40,7 @@ def parse_args():
     parser.add_argument("--algorithm", type=str, default=None, help="Override algorithm (e.g., 'all', 'test', 'greedy')")
     parser.add_argument("--fl", action="store_true", help="Run FL experiments")
     parser.add_argument("--task", type=str, default=None, help="FL task to run (e.g. 'reddit_nwp', 'cifar10', 'iot_anomaly'). Runs all if omitted.")
+    parser.add_argument("--results-tag", type=str, default="", help="Optional suffix tag for result CSV filenames")
     return parser.parse_args()
 
 
@@ -427,7 +428,7 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
 
 def run_full_sweep(
     algorithms, nodes, clients, candidates, budget, cost, thresh, alpha, beta, delta_list,
-    duration_hours, time_step_seconds, outer_interval_minutes, target_snr
+    duration_hours, time_step_seconds, outer_interval_minutes, target_snr, results_tag=""
 ):
     os.makedirs("results", exist_ok=True)
     ts = load.timescale()
@@ -435,9 +436,10 @@ def run_full_sweep(
     weather = TwoStateWeatherMarkov(dt_seconds=time_step_seconds)
     for name, algo in algorithms.items():
         rows = []
+        t_now = start  # use start time for initial selection
         selected = algo(
             candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
-            alpha=alpha, beta=beta, delta_list=delta_list
+            alpha=alpha, beta=beta, delta_list=delta_list, t_now=t_now
         )
         total_steps = int((duration_hours*3600)//time_step_seconds)
         for step in range(total_steps):
@@ -465,12 +467,13 @@ def run_full_sweep(
             if (step*time_step_seconds)%(outer_interval_minutes*60) == 0 and step > 0:
                 selected = algo(
                     candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
-                    alpha=alpha, beta=beta, delta_list=delta_list
+                    alpha=alpha, beta=beta, delta_list=delta_list, t_now=t_now
                 )
         
         losses = [r[2] for r in rows]
         cvar = compute_cvar(losses, alpha=0.05)
-        csv_path = f"results/{name}_metrics.csv"
+        tag = f"_{results_tag}" if results_tag else ""
+        csv_path = f"results/{name}{tag}_metrics.csv"
         with open(csv_path,'w') as f:
             f.write('step,latency,amse,energy,cvar5\n')
             for r in rows:
@@ -553,6 +556,25 @@ def main():
     if args.fl:
         log.info("--- FL flag set: launching run_fl_experiments ---")
         run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots", task_filter=args.task)
+
+    if duration_hours > 0:
+        run_full_sweep(
+            algorithms=algorithms,
+            nodes=nodes,
+            clients=clients,
+            candidates=candidates,
+            budget=budget,
+            cost=cost,
+            thresh=thresh,
+            alpha=alpha,
+            beta=beta,
+            delta_list=delta_list,
+            duration_hours=duration_hours,
+            time_step_seconds=time_step_seconds,
+            outer_interval_minutes=outer_interval_minutes,
+            target_snr=target_snr,
+            results_tag=args.results_tag,
+        )
 
     if alg in ['all', 'test']:
         total_amse_n = {}

@@ -38,8 +38,16 @@ class SaginChannelModel:
             LinkType.LEO_HAP: LinkParams(k_db=8.0, coherence_time_s=12.0),
         }
         self._weather_state = "clear"
+        self._weather_loss_db_override: float | None = None
         self._snr_state: Dict[Tuple[int, int], float] = {}
         self._last_t: Dict[Tuple[int, int], float] = {}
+        
+    def set_weather_loss_db(self, loss_db: float | None):
+        """Set fixed atmospheric attenuation (dB) from external environment model.
+
+        When set to ``None``, the internal weather Markov model is used.
+        """
+        self._weather_loss_db_override = None if loss_db is None else float(loss_db)
 
     def classify_link(self, node1, node2) -> LinkType:
         types = {node1.type.value, node2.type.value}

@@ -1,3 +1,0 @@
-dict = {}
-
-print(len(dict))

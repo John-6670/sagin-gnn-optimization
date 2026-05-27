@@ -6,13 +6,8 @@ matplotlib
 skyfield
 
 # Machine Learning
-# Install PyTorch wheels built for CUDA 12.6 (match your system CUDA/driver).
-# This uses the PyTorch wheel index for CUDA 12.6. If you prefer CPU-only,
-# replace the three pinned lines with plain `torch`, `torchvision`, `torchaudio`.
---extra-index-url https://download.pytorch.org/whl/cu126
-torch==2.12.0+cu126
-# Use torchvision/torchaudio wheels that match torch+cu126
-torchvision==0.17.1
+torch
+torchvision
 scikit-learn
 
 # Graph Neural Networks
