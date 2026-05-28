@@ -50,8 +50,15 @@ def digital_compress(gradient, num_bits=8):
 
 
 def hybrid_patch(clients, server, snr_map, delta_list, num_bits=8):
-    g_majority, amse_analog, stragglers, majority = aircomp_aggregate(clients, server, snr_map, delta_list)
-    K = len(clients)
+    low_snr_clients = detect_low_snr_clients(
+        clients,
+        server,
+        snr_map,
+    )
+    
+    analog_clients = [c for c in clients if c not in low_snr_clients]
+    g_majority, amse_analog, stragglers, majority = aircomp_aggregate(analog_clients, server, snr_map, delta_list)
+    K = len(analog_clients)
     if K == 0:
         return np.array([]), 0.0, {"stragglers": [], "majority": []}
 
@@ -74,3 +81,15 @@ def hybrid_patch(clients, server, snr_map, delta_list, num_bits=8):
     g_hybrid = w_a * g_majority + w_d * g_digital
     amse_bound = (w_a**2) * amse_analog + (w_d**2) * eps_q
     return g_hybrid, float(amse_bound), {"stragglers": stragglers, "majority": majority, "w_a": w_a, "w_d": w_d}
+
+
+def detect_low_snr_clients(clients, server, snr_map, threshold=3.0):
+    low_clients = []
+
+    for c in clients:
+        snr = snr_map[c][server]
+
+        if snr < threshold:
+            low_clients.append(c)
+
+    return low_clients

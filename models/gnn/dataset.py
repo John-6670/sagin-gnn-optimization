@@ -44,39 +44,136 @@ class SAGINSnapshotDataset(Dataset):
         data = HeteroData()
         type_map = {NodeType.SATELLITE: 'satellite', NodeType.UAV: 'hap', NodeType.GROUND: 'ground', NodeType.CLIENT: 'client'}
         node_to_local = {}
+        node_objects = {}
         for t in type_map.values():
             data[t].x = []
+            node_objects[t] = []
 
         for n in nodes:
             tname = type_map[n.type]
-            feat = np.array([*n.position, n.power, n.noise_variance, float(n.type == NodeType.CLIENT)], dtype=np.float32)
-            node_to_local[n.id] = (tname, len(data[tname].x))
+            node_objects[tname].append(n)
+            type_feat = {
+                NodeType.SATELLITE: [1, 0, 0, 0],
+                NodeType.UAV: [0, 1, 0, 0],
+                NodeType.GROUND: [0, 0, 1, 0],
+                NodeType.CLIENT: [0, 0, 0, 1],
+            }[n.type]
+
+            feat = np.array(
+                [
+                    *n.position,
+                    n.power,
+                    n.noise_variance,
+                    *type_feat,
+                ],
+                dtype=np.float32,
+            )
+            node_to_local[n.id] = (
+                tname,
+                len(data[tname].x),
+            )
             data[tname].x.append(feat)
 
+        candidate_lookup = {}
+        placement_types = ['satellite', 'hap', 'ground']
+
         for t in type_map.values():
-            data[t].x = torch.tensor(np.array(data[t].x), dtype=torch.float32)
+            if len(data[t].x) == 0:
+                continue
+
+            original_nodes = node_objects[t]
+
+            lookup = {}
+
+            for idx, node in enumerate(original_nodes):
+                lookup[idx] = node
+
+            candidate_lookup[t] = lookup
+
+            data[t].x = torch.tensor(
+                np.array(data[t].x),
+                dtype=torch.float32
+            )
+        
+        selected = candidates[: max(1, len(candidates) // 20)]
+        base_utility = compute_utility(
+            selected,
+            clients,
+            alpha=0.5,
+            beta=0.5,
+            delta_list=[0.1, 0.05]
+        )
+
+        for t in placement_types:
+            if t not in candidate_lookup:
+                continue
+
+            num_nodes = data[t].x.shape[0]
+
+            labels = []
+
+            for idx in range(num_nodes):
+
+                candidate = candidate_lookup[t][idx]
+
+                new_servers = list(selected)
+
+                if candidate not in new_servers:
+                    new_servers.append(candidate)
+
+                new_utility = compute_utility(
+                    new_servers,
+                    clients,
+                    alpha=0.5,
+                    beta=0.5,
+                    delta_list=[0.1, 0.05]
+                )
+
+                # Positive gain = utility improvement
+                marginal_gain = base_utility - new_utility
+
+                labels.append(float(marginal_gain))
+
+            labels = np.asarray(labels, dtype=np.float32)
+
+            if len(labels) > 1:
+                mean = labels.mean()
+                std = labels.std() + 1e-6
+                labels = (labels - mean) / std
+
+            data[t].y = torch.tensor(
+                labels,
+                dtype=torch.float32
+            )
 
         edge_store = {}
+        edge_attr_store = {}
         for c in clients:
             for s in candidates:
                 snr = c.compute_snr_to(s)
-                if snr < self.snr_threshold:
+                if (
+                    not np.isfinite(snr)
+                    or snr < self.snr_threshold
+                ):
                     continue
+                
+                if c.id == s.id:
+                    continue
+                
                 src_t, src_i = node_to_local[c.id]
                 dst_t, dst_i = node_to_local[s.id]
                 et = (src_t, 'link', dst_t)
                 edge_store.setdefault(et, [[], []])
                 edge_store[et][0].append(src_i)
                 edge_store[et][1].append(dst_i)
+                edge_attr_store.setdefault(et, [])
+                edge_attr_store[et].append([float(snr)])
 
         for et, eidx in edge_store.items():
             data[et].edge_index = torch.tensor(eidx, dtype=torch.long)
+            data[et].edge_attr = torch.tensor(
+                edge_attr_store[et],
+                dtype=torch.float32
+            )
 
-        S = candidates[: max(1, len(candidates)//10)]
-        base = compute_utility(S, clients, 0.5, 0.5, [0.1, 0.2])
-        labels = {}
-        for s in candidates:
-            gain = base - compute_utility(S + [s], clients, 0.5, 0.5, [0.1, 0.2])
-            labels[s.id] = gain
-        data['labels'] = labels
         return data

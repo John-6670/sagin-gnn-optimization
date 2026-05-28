@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from simulation.topology.patching import hybrid_patch, aircomp_aggregate
 
+from fl.convergence import ConvergenceTracker
 from .device import DEVICE
 
 log = logging.getLogger("fl.trainer")
@@ -32,6 +33,7 @@ def _eval(model, test_loader, criterion):
     acc = correct / max(total, 1)
     return loss / max(total, 1), acc
 
+CONVERGENCE_TRACKER = ConvergenceTracker()
 
 def FederatedRound(
     round_idx, clients, servers, ota_params, task, global_model,
@@ -83,7 +85,16 @@ def FederatedRound(
     if use_hybrid:
         _, amse_round, meta = hybrid_patch([clients[i] for i in active], servers[0], snr_map, delta_list)
         w = np.array([meta['w_a'], meta['w_d']])
-        g = np.mean(grads, axis=0) * w.sum()
+        base_gradient = np.mean(grads, axis=0)
+
+        noise_std = np.sqrt(max(amse_round, 1e-12))
+        aggregation_noise = np.random.normal(
+            0.0,
+            noise_std,
+            size=base_gradient.shape,
+        )
+
+        g = (base_gradient + aggregation_noise) * w.sum()
         log.debug("  Round %d: hybrid_patch amse=%.6f  w_a=%.4f  w_d=%.4f  w_sum=%.4f",
                   round_idx, amse_round, meta['w_a'], meta['w_d'], w.sum())
     else:
@@ -101,6 +112,12 @@ def FederatedRound(
 
     loss, acc = _eval(global_model, test_loader, task.criterion)
     log.debug("  Round %d: eval complete — loss=%.6f  acc=%.4f", round_idx, loss, acc)
+    CONVERGENCE_TRACKER.update(
+        round_idx,
+        loss,
+        acc,
+        amse_round,
+    )
     return {
         'round': round_idx,
         'active_clients': len(active),

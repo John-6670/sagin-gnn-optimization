@@ -37,39 +37,60 @@ def sample_snr_scenarios(clients, candidates, t_now, N: int, coherence_time: flo
 
 
 def _cvar(values: Sequence[float], alpha_cvar: float) -> float:
-    if len(values) == 0:
+    if not values:
         return 0.0
     arr = np.asarray(values, dtype=float)
     q = np.quantile(arr, alpha_cvar)
-    tail = arr[arr >= q]
-    return float(np.mean(tail)) if tail.size else float(q)
+    tail = arr[arr <= q]
+    return float(np.mean(tail)) if len(tail) > 0 else float(q)
 
 
 def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_cvar: float):
-    """Worst-case CVaR gain under Wasserstein radius epsilon using dual lambda via bisection."""
-    losses = []
+    scenario_gains = []
+
     for snr_map in scenarios.scenarios:
-        curr = compute_utility(S, scenarios.clients, scenarios.alpha, scenarios.beta, scenarios.delta_list, snr_map=snr_map)
-        new = compute_utility(S + [v], scenarios.clients, scenarios.alpha, scenarios.beta, scenarios.delta_list, snr_map=snr_map)
-        losses.append(curr - new)
+        curr = compute_utility(
+            S,
+            scenarios.clients,
+            scenarios.alpha,
+            scenarios.beta,
+            scenarios.delta_list,
+            snr_map=snr_map,
+        )
 
-    norms = np.abs(losses)
+        new = compute_utility(
+            S + [v],
+            scenarios.clients,
+            scenarios.alpha,
+            scenarios.beta,
+            scenarios.delta_list,
+            snr_map=snr_map,
+        )
 
-    def dual_obj(lam: float) -> float:
-        inner = np.maximum(0.0, np.asarray(losses) - lam * norms)
-        return lam * epsilon + float(np.mean(inner))
+        gain = curr - new
+        scenario_gains.append(gain)
 
-    lo, hi = 0.0, 1e3
-    for _ in range(60):
-        m1 = lo + (hi - lo) / 3
-        m2 = hi - (hi - lo) / 3
-        if dual_obj(m1) < dual_obj(m2):
-            hi = m2
-        else:
-            lo = m1
-    lam_star = (lo + hi) / 2
-    wc_cvar = _cvar(losses, alpha_cvar) - lam_star * epsilon
-    return float(wc_cvar), float(lam_star)
+    gains = np.asarray(scenario_gains)
+    mean_gain = float(np.mean(gains))
+    std_gain = float(np.std(gains))
+
+    cvar = _cvar(gains.tolist(), alpha_cvar)
+    penalty = epsilon * std_gain
+
+    robust_gain = cvar - penalty
+    
+    if S:
+        avg_lat = np.mean([c.get_latency_to(v) for c in scenarios.clients])
+        latency_penalty = 0.3 * avg_lat
+        robust_gain -= latency_penalty
+    
+    if robust_gain < 1e-6 and mean_gain > 0:
+        robust_gain = mean_gain * 0.7
+
+    return float(robust_gain), {
+        'mean_gain': mean_gain,
+        'cvar': float(cvar),
+    }
 
 
 def local_one_swap(S, candidates, budget, cost, scenarios: ScenarioBundle, epsilon, alpha_cvar):

@@ -1,8 +1,8 @@
 simulation:
-  num_sats: 5
-  num_uavs: 3
-  num_ground: 4
-  num_clients: 5
+  num_sats: 36
+  num_uavs: 8
+  num_ground: 20
+  num_clients: 500
   area_size: 2000
   gradient_dim: 100
   sigma2: 10
@@ -16,7 +16,7 @@ simulation:
 algorithm:
   alpha: 0.5
   beta: 0.5
-  budget: 20
+  budget: 50
   delta_list:
     - 0.1
     - 0.2

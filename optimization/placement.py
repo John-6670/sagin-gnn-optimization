@@ -5,6 +5,7 @@ from simulation.topology.nodes import Node, NodeType
 from optimization.objective import compute_utility
 from optimization.dro import ScenarioBundle, sample_snr_scenarios, robust_marginal_gain, local_one_swap
 from optimization.meta_learner import MAMLInnerOptimizer
+from models.gnn.train import predict_candidate_scores
 
 
 class KalmanTimingFilter:
@@ -73,7 +74,23 @@ def predictive_ota_control(selected_servers: List[Node], clients: List[Node], t_
 
             channel_phase = np.angle(hs[idx][0])
             pre_equalization_phase = -channel_phase + phase_bias + np.angle(w_star[0])
-            optimized_power = min(client.power, (target_snr / snrs[idx]) * power_scale)
+            required_power = target_snr / max(snrs[idx], 1e-9)
+
+            channel_penalty = 1.0 + abs(channel_phase) / np.pi
+            mobility_penalty = 1.0 + mobility
+            traffic_penalty = 1.0 + traffic
+
+            optimized_power = required_power
+            optimized_power *= channel_penalty
+            optimized_power *= mobility_penalty
+            optimized_power *= traffic_penalty
+            optimized_power *= power_scale
+
+            optimized_power = float(np.clip(
+                optimized_power,
+                1e-4,
+                client.power,
+            ))
             
             control_params[client.id] = {
                 "power": optimized_power,
@@ -93,6 +110,23 @@ def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float]
     best_snr = {c: 0.0 for c in clients}
     S, total_cost = [], 0
     candidates_cp = candidates.copy()
+    
+    if hasattr(greedy_server_selection, 'gnn_model'):
+        scores = predict_candidate_scores(
+            greedy_server_selection.gnn_model,
+            candidates_cp,
+            clients,
+            selected_servers=[]
+        )
+
+        sorted_candidates = sorted(
+            candidates_cp,
+            key=lambda x: scores.get(x, -1e9),
+            reverse=True
+        )
+
+        top_k = max(5, int(0.3 * len(sorted_candidates)))
+        candidates_cp = sorted_candidates[:top_k]
 
     while candidates_cp:
         best_server, best_gain = None, -float("inf")
@@ -137,21 +171,30 @@ def _gnn_prune_candidates(candidates, clients, kappa=0.15, checkpoint=None):
 def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, t_now=None,
                                 epsilon=0.1, alpha_cvar=0.9, N=64, coherence_time=25.0, sigma_snr=0.35,
                                 gnn_checkpoint=None, kappa=0.15):
-    C = _gnn_prune_candidates(candidates, clients, kappa=kappa, checkpoint=gnn_checkpoint)
-    scenario_maps = sample_snr_scenarios(clients, C, t_now, N=N, coherence_time=coherence_time, sigma_snr=sigma_snr)
+    C = _gnn_prune_candidates(candidates, clients, kappa=0.3, checkpoint=gnn_checkpoint)
+    scenario_maps = sample_snr_scenarios(clients, C, t_now, N=64, coherence_time=coherence_time, sigma_snr=sigma_snr)
     bundle = ScenarioBundle(scenarios=scenario_maps, clients=clients, candidates=C, delta_list=delta_list, alpha=alpha, beta=beta)
     S, total_cost, remaining = [], 0.0, list(C)
+    
     while remaining:
         best_v, best_score = None, -float('inf')
         for v in remaining:
-            if total_cost + cost[v] > budget:
+            if total_cost + cost.get(v, 0) > budget:
                 continue
             score, _ = robust_marginal_gain(S, v, bundle, epsilon=epsilon, alpha_cvar=alpha_cvar)
             if score > best_score:
                 best_score, best_v = score, v
-        if best_v is None or best_score <= thresh:
+        
+        if best_v is None or best_score <= 1e-6:
             break
+        
         S.append(best_v)
         total_cost += cost[best_v]
         remaining.remove(best_v)
+    
+    if not S and candidates:
+        print("DR fallback to greedy")
+        fallback = greedy_server_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, t_now)
+        return fallback[:1] if fallback else S
+    
     return local_one_swap(S, C, budget, cost, bundle, epsilon=epsilon, alpha_cvar=alpha_cvar)
