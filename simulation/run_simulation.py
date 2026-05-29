@@ -4,6 +4,7 @@ from collections import defaultdict
 import numpy as np
 from matplotlib import pyplot as plt
 import os
+import shutil
 import logging
 from datetime import datetime
 from skyfield.api import load, utc
@@ -428,8 +429,12 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
 
 def run_full_sweep(
     algorithms, nodes, clients, candidates, budget, cost, thresh, alpha, beta, delta_list,
-    duration_hours, time_step_seconds, outer_interval_minutes, target_snr, results_tag=""
+    duration_hours, time_step_seconds, outer_interval_minutes, target_snr, N, results_tag=""
 ):
+    if os.path.exists("results"):
+        log.warning("Results directory already exists. New results will be added but old files may be overwritten if names collide.")
+        shutil.rmtree("results")
+    
     os.makedirs("results", exist_ok=True)
     ts = load.timescale()
     start = ts.now()
@@ -439,7 +444,7 @@ def run_full_sweep(
         t_now = start  # use start time for initial selection
         selected = algo(
             candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
-            alpha=alpha, beta=beta, delta_list=delta_list, t_now=t_now
+            alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
         )
         total_steps = int((duration_hours*3600)//time_step_seconds)
         for step in range(total_steps):
@@ -454,7 +459,9 @@ def run_full_sweep(
                 if hasattr(n,'channel_model'):
                     n.channel_model.set_weather_loss_db(loss_db)
             
-            ota = predictive_ota_control(selected, clients, t_now, target_snr)
+            avg_traffic = float(np.mean([c.load for c in clients])) if clients else 0.5
+            avg_mobility = float(np.mean([np.linalg.norm(s.get_velocity_at(t_now)) for s in selected])) if selected else 0.0
+            ota = predictive_ota_control(selected, clients, t_now, target_snr, traffic=avg_traffic, mobility=avg_mobility)
             amse_vals = []
             for s in selected:
                 snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
@@ -463,21 +470,32 @@ def run_full_sweep(
             lat = compute_e2e_latency(clients, selected, t_now)
             energy = compute_total_energy(clients, ota, transmission_time=time_step_seconds)
             amse = float(np.mean(amse_vals)) if amse_vals else 0.0
-            rows.append((step, lat, amse, energy))
+            # Use rolling window of last 30 steps for CVaR (matches outer_interval_minutes)
+            window_size = 30
+            losses = [r[2] for r in rows[-window_size:]] + [amse]
+            cvar_step = compute_cvar(losses, alpha=0.05)
+            rows.append((step, lat, amse, energy, cvar_step))
+            
+            # Debug logging for energy anomalies
+            if step > 0 and step % 10 == 0:
+                avg_power = energy / len(clients) if clients else 0
+                log.debug(f"Step {step}: energy={energy:.2f}, avg_power_per_client={avg_power:.4f}, num_servers={len(selected)}, num_clients={len(clients)}")
+            
             if (step*time_step_seconds)%(outer_interval_minutes*60) == 0 and step > 0:
+                old_selected = selected
                 selected = algo(
                     candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
-                    alpha=alpha, beta=beta, delta_list=delta_list, t_now=t_now
+                    alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
                 )
+                if len(old_selected) != len(selected):
+                    log.info(f"Server re-selection at step {step}: {len(old_selected)} → {len(selected)} servers")
         
-        losses = [r[2] for r in rows]
-        cvar = compute_cvar(losses, alpha=0.05)
         tag = f"_{results_tag}" if results_tag else ""
         csv_path = f"results/{name}{tag}_metrics.csv"
         with open(csv_path,'w') as f:
             f.write('step,latency,amse,energy,cvar5\n')
             for r in rows:
-                f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{cvar}\n")
+                f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]}\n")
 
 
 def main():
@@ -496,11 +514,10 @@ def main():
     gradient_dim = config['simulation'].get('gradient_dim', 100)
     sigma2 = config['simulation'].get('sigma2', 10)
     alg = args.algorithm or config['simulation'].get('algorithm', 'all')
-
-    # New config params
     duration_hours = config["simulation"].get("duration_hours", 0.0)
     time_step_seconds = config["simulation"].get("time_step_seconds", 10)
     outer_interval_minutes = config["simulation"].get("outer_interval_minutes", 30)
+    num_scenarios = config["simulation"].get("num_scenarios", 16)
 
     alpha = config["algorithm"].get("alpha", 0.5)
     beta = config["algorithm"].get("beta", 0.5)
@@ -523,12 +540,15 @@ def main():
 
     log.info("Simulation params: sats=%d  uavs=%d  ground=%d  clients=%d  area=%d  gradient_dim=%d  sigma2=%s",
              num_sats, num_uavs, num_ground, num_clients, area_size, gradient_dim, sigma2)
-    log.info("Algorithm params: alg=%s  budget=%d  alpha=%s  beta=%s  thresh=%s  target_snr=%s  delta_list=%s",
-             alg, budget, alpha, beta, thresh, target_snr, delta_list)
+    log.info("Algorithm params: alg=%s  budget=%d  alpha=%s  beta=%s  thresh=%s  target_snr=%s  delta_list=%s  num_scenarios=%s",
+             alg, budget, alpha, beta, thresh, target_snr, delta_list, num_scenarios)
 
     if args.seed is not None:
         np.random.seed(args.seed)
         log.info("Random seed set to %d", args.seed)
+
+    ts = load.timescale()
+    start = ts.now()
 
     log.info("Generating nodes...")
     nodes = generate_nodes(
@@ -537,7 +557,8 @@ def main():
         num_ground=num_ground,
         num_clients=num_clients,
         area_size=area_size,
-        gradient_dim=gradient_dim
+        gradient_dim=gradient_dim,
+        t0=start
     )
 
     clients = [n for n in nodes if n.type == NodeType.CLIENT]
@@ -573,6 +594,7 @@ def main():
             time_step_seconds=time_step_seconds,
             outer_interval_minutes=outer_interval_minutes,
             target_snr=target_snr,
+            N=num_scenarios,
             results_tag=args.results_tag,
         )
 
@@ -591,7 +613,8 @@ def main():
                 thresh=thresh,
                 alpha=alpha,
                 beta=beta,
-                delta_list=delta_list
+                delta_list=delta_list,
+                N=num_scenarios
             )
             print(f'--- Algorithm {name} Summary ---')
             print(f"Area size: {area_size} x {area_size}")
@@ -633,6 +656,7 @@ def main():
                 alpha=alpha,
                 beta=beta,
                 delta_list=delta_list,
+                N=num_scenarios,
                 t_now=start_time
             )
             print(f'--- Dynamic Algorithm {dynamic_name} Initial Summary ---')
@@ -727,7 +751,8 @@ def main():
             thresh=thresh,
             alpha=alpha,
             beta=beta,
-            delta_list=delta_list
+            delta_list=delta_list,
+            N=num_scenarios,
         )
         log.info("Algorithm %s selected %d server(s):", alg, len(selected_servers))
         for s in selected_servers:

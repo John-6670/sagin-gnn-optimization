@@ -3,6 +3,16 @@ import numpy as np
 from simulation.topology.nodes import Node
 
 
+def _num_hops(server: Node) -> int:
+    """Number of aggregation hops L(k,n) by server tier."""
+    from simulation.topology.nodes import NodeType
+    if server.type == NodeType.GROUND:
+        return 1
+    if server.type == NodeType.UAV:
+        return 2
+    return 3  # SATELLITE
+
+
 # AMSE(k, n)
 def compute_amse_kn(client: Node, server: Node, delta_list, t_now=None):
     if t_now is not None:
@@ -13,7 +23,9 @@ def compute_amse_kn(client: Node, server: Node, delta_list, t_now=None):
     if snr <= 0.0:
         return float("inf")
 
-    cascaded_error = np.prod([1 + d for d in delta_list])
+    L = _num_hops(server)
+    active_deltas = delta_list[:L]
+    cascaded_error = np.prod([1 + d for d in active_deltas]) if active_deltas else 1.0
     return (client.noise_variance * client.gradient_dim / snr) * cascaded_error
 
 

@@ -105,7 +105,7 @@ def predictive_ota_control(selected_servers: List[Node], clients: List[Node], t_
     return ota_results
 
 
-def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float], thresh, alpha, beta, delta_list, t_now=None) -> List[Node]:
+def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float], thresh, alpha, beta, delta_list, N, t_now=None) -> List[Node]:
     snr_map = {c: {s: c.compute_snr_to(s, t_now) for s in candidates} for c in clients}
     best_snr = {c: 0.0 for c in clients}
     S, total_cost = [], 0
@@ -170,31 +170,48 @@ def _gnn_prune_candidates(candidates, clients, kappa=0.15, checkpoint=None):
 
 def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, t_now=None,
                                 epsilon=0.1, alpha_cvar=0.9, N=64, coherence_time=25.0, sigma_snr=0.35,
-                                gnn_checkpoint=None, kappa=0.15):
-    C = _gnn_prune_candidates(candidates, clients, kappa=0.3, checkpoint=gnn_checkpoint)
-    scenario_maps = sample_snr_scenarios(clients, C, t_now, N=64, coherence_time=coherence_time, sigma_snr=sigma_snr)
-    bundle = ScenarioBundle(scenarios=scenario_maps, clients=clients, candidates=C, delta_list=delta_list, alpha=alpha, beta=beta)
+                                gnn_checkpoint=None, kappa=0.30, tau_amse=None):
+    from optimization.dro import bisect_lambda_for_amse_target
+    # Increase kappa from 0.15 to 0.30 to match greedy's pruning level (30% instead of 15%)
+    C = _gnn_prune_candidates(candidates, clients, kappa=kappa, checkpoint=gnn_checkpoint)
+    scenario_maps = sample_snr_scenarios(clients, C, t_now, N=N,
+                                        coherence_time=coherence_time, sigma_snr=sigma_snr)
+    # Precompute latency map for this selection time to avoid repeated expensive calls
+    latency_map = {c: {s: c.get_latency_to(s, t_now) for s in C} for c in clients}
+    bundle = ScenarioBundle(scenarios=scenario_maps, clients=clients, candidates=C,
+                            delta_list=delta_list, alpha=alpha, beta=beta, latency_map=latency_map)
     S, total_cost, remaining = [], 0.0, list(C)
-    
     while remaining:
         best_v, best_score = None, -float('inf')
         for v in remaining:
-            if total_cost + cost.get(v, 0) > budget:
+            if total_cost + cost[v] > budget:
                 continue
             score, _ = robust_marginal_gain(S, v, bundle, epsilon=epsilon, alpha_cvar=alpha_cvar)
             if score > best_score:
                 best_score, best_v = score, v
-        
-        if best_v is None or best_score <= 1e-6:
+        # Stop only when no feasible server exists or gain is genuinely negative
+        if best_v is None or best_score < -1e-6:
             break
-        
         S.append(best_v)
         total_cost += cost[best_v]
         remaining.remove(best_v)
-    
-    if not S and candidates:
-        print("DR fallback to greedy")
-        fallback = greedy_server_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, t_now)
-        return fallback[:1] if fallback else S
-    
+        # Algorithm 2 Phase 2: enforce CVaR AMSE target (Eq. 37)
+        if tau_amse is not None:
+            bisect_lambda_for_amse_target(S, bundle, alpha_cvar, tau_amse)
+
+    if not S:
+        empty_obj = compute_utility([], clients, alpha, beta, delta_list)
+        best_v = None
+        best_val = float('inf')
+        for v in C:
+            if cost[v] > budget:
+                continue
+            value = compute_utility([v], clients, alpha, beta, delta_list, latency_map=latency_map)
+            if value < best_val:
+                best_val = value
+                best_v = v
+
+        if best_v is not None and best_val < empty_obj:
+            S.append(best_v)
+
     return local_one_swap(S, C, budget, cost, bundle, epsilon=epsilon, alpha_cvar=alpha_cvar)

@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 import yaml
 from torch_geometric.loader import DataLoader
+import pickle
 
 from models.gnn.dataset import SAGINSnapshotDataset
 from models.gnn.hgnn import SAGINHeteroGNN, SubmodularityRegularizer, SNRGradientPenalty
@@ -54,6 +55,9 @@ def train_gnn(epochs=10, batch_size=8, lr=3e-4, checkpoint_path='checkpoints/sag
 
     Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), checkpoint_path)
+    meta_path = Path(checkpoint_path).with_suffix('.meta.pkl')
+    with open(meta_path, 'wb') as f:
+        pickle.dump({'metadata': sample.metadata(), 'in_dims': in_dims}, f)
     _write_checkpoint_to_config(checkpoint_path)
     return checkpoint_path
 
@@ -68,98 +72,78 @@ def _write_checkpoint_to_config(path):
 
 
 def load_gnn_for_inference(checkpoint=None):
-    ckpt_path = checkpoint
-
-    # Load from config if not manually specified
-    if ckpt_path is None:
-        cfg_path = Path("configs/default.yaml")
-
-        if cfg_path.exists():
-            cfg = yaml.safe_load(cfg_path.read_text()) or {}
-            ckpt_path = (cfg.get("gnn") or {}).get("checkpoint")
-
-    # No checkpoint available
-    if not ckpt_path:
-        print("[WARN] No GNN checkpoint specified")
+    if checkpoint is None:
+        checkpoint = 'checkpoints/sagin_hgnn.pt'
+    ckpt_path = Path(checkpoint)
+    meta_path = ckpt_path.with_suffix('.meta.pkl')
+    if not ckpt_path.exists() or not meta_path.exists():
         return None
-
-    path = Path(ckpt_path)
-
-    if not path.exists():
-        print(f"[WARN] Checkpoint not found: {path}")
+    try:
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
+        m = SAGINHeteroGNN(meta['metadata'], in_dims=meta['in_dims'])
+        m.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
+        m.eval()
+        return m
+    except Exception as e:
+        print(f"[GNN] load failed: {e}")
         return None
-
-    # Build temporary dataset sample to infer metadata
-    ds = SAGINSnapshotDataset(num_samples=1)
-
-    if len(ds) == 0:
-        print("[WARN] Empty SAGIN dataset")
-        return None
-
-    sample = ds[0]
-
-    # Infer feature dimensions
-    in_dims = {}
-
-    for node_type in sample.node_types:
-        in_dims[node_type] = sample[node_type].x.shape[1]
-
-    # Create model
-    model = SAGINHeteroGNN(
-        metadata=sample.metadata(),
-        in_dims=in_dims,
-    )
-
-    # Load weights
-    state = torch.load(path, map_location="cpu")
-
-    # Support both raw state_dict and wrapped checkpoints
-    if isinstance(state, dict) and "model_state_dict" in state:
-        state = state["model_state_dict"]
-
-    model.load_state_dict(state)
-
-    model.eval()
-
-    print(f"[INFO] Loaded HGNN checkpoint from {path}")
-
-    return model
 
 
 def predict_candidate_scores(model, candidates, clients, selected_servers=None):
     if model is None:
-        return {c: 1.0 for c in candidates}
+        return {c: 0.0 for c in candidates}
+    import numpy as np
+    from torch_geometric.data import HeteroData
+    from simulation.topology.nodes import NodeType
 
-    if selected_servers is None:
-        selected_servers = []
+    type_map = {NodeType.SATELLITE: 'satellite', NodeType.UAV: 'hap',
+                NodeType.GROUND: 'ground', NodeType.CLIENT: 'client'}
+    data = HeteroData()
+    node_to_local = {}
+    for t in type_map.values():
+        data[t].x = []
 
-    graph_data, node_maps = build_graph_snapshot(
-        candidates=candidates,
-        clients=clients,
-        selected_servers=selected_servers,
-    )
+    for n in list(candidates) + list(clients):
+        tname = type_map[n.type]
+        feat = np.array([*n.position, n.power, n.noise_variance,
+                         float(n.type == NodeType.CLIENT)], dtype=np.float32)
+        node_to_local[n.id] = (tname, len(data[tname].x))
+        data[tname].x.append(feat)
+
+    for t in type_map.values():
+        rows = data[t].x
+        data[t].x = (torch.tensor(np.array(rows), dtype=torch.float32)
+                     if rows else torch.zeros((0, 6), dtype=torch.float32))
+
+    edge_store = {}
+    for c in clients:
+        for s in candidates:
+            if c.compute_snr_to(s) < 1e-6:
+                continue
+            st, si = node_to_local[c.id]
+            dt, di = node_to_local[s.id]
+            et = (st, 'link', dt)
+            edge_store.setdefault(et, [[], []])
+            edge_store[et][0].append(si)
+            edge_store[et][1].append(di)
+    for et, eidx in edge_store.items():
+        data[et].edge_index = torch.tensor(eidx, dtype=torch.long)
 
     placement_mask = torch.zeros(
-        sum(graph_data[k].x.size(0) for k in graph_data.node_types),
-        dtype=torch.bool,
-    )
-
-    model.eval()
-
-    with torch.no_grad():
-        preds = model(graph_data, placement_mask)
+        sum(data[k].x.size(0) for k in data.node_types), dtype=torch.bool)
+    try:
+        with torch.no_grad():
+            preds = model(data, placement_mask)
+    except Exception as e:
+        print(f"[GNN] inference error: {e}")
+        return {c: 0.0 for c in candidates}
 
     scores = {}
-
-    for node_type, mapping in node_maps.items():
-        if node_type not in preds:
-            continue
-
-        pred_tensor = preds[node_type]
-
-        for idx, node in mapping.items():
-            scores[node] = float(pred_tensor[idx].item())
-
+    for c in candidates:
+        tname, idx = node_to_local[c.id]
+        scores[c] = float(preds[tname][idx].item()) if (
+            tname in preds and idx < preds[tname].size(0)) else 0.0
     return scores
 
 

@@ -1,22 +1,23 @@
 simulation:
-  num_sats: 36
-  num_uavs: 8
-  num_ground: 20
-  num_clients: 500
+  num_sats: 4
+  num_uavs: 2
+  num_ground: 5
+  num_clients: 10
   area_size: 2000
   gradient_dim: 100
   sigma2: 10
   algorithm: test
+  num_scenarios: 8
 
   # Dynamic Simulation Parameters
-  duration_hours: 0.5         # Total simulation time
-  time_step_seconds: 10       # Inner loop execution frequency (Fast timescale)
+  duration_hours: 6         # Total simulation time
+  time_step_seconds: 60       # Inner loop execution frequency (Fast timescale)
   outer_interval_minutes: 30  # Outer loop execution frequency (Slow timescale)
 
 algorithm:
-  alpha: 0.5
-  beta: 0.5
-  budget: 50
+  alpha: 0.8
+  beta: 0.2
+  budget: 30
   delta_list:
     - 0.1
     - 0.2

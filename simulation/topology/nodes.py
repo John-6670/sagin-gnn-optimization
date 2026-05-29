@@ -87,7 +87,7 @@ def generate_nodes(num_sats, num_uavs, num_ground, num_clients, area_size, gradi
     nodes = []
     
     tle_list = None
-    if t0 is not None and num_sats > 0:
+    if num_sats > 0:
         walker = WalkerConstellation(num_planes=6, sats_per_plane=6, phasing=1, inclination=53.0, altitude_km=550.0)
         tle_list = walker.generate_tle_list(t0)
 

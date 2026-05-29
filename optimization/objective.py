@@ -8,17 +8,36 @@ def weighted_compound_loss(latency, amse, alpha, beta):
     return alpha * latency + beta * amse
 
 
-def compute_amse_kn_from_snr(client, snr, delta_list):
+def _num_hops_from_server(server) -> int:
+    """Hops L(k,n) by server node type."""
+    from simulation.topology.nodes import NodeType
+    if server.type == NodeType.GROUND:
+        return 1
+    if server.type == NodeType.UAV:
+        return 2
+    return 3  # SATELLITE
+
+
+def compute_amse_kn_from_snr(client, snr, delta_list, server=None):
+    """AMSE surrogate per Eq. 20 — uses tier-specific cascaded error L(k,n)."""
     if snr <= 1e-12:
         return float("inf")
 
-    cascaded_error = np.prod([1 + d for d in delta_list])
+    if server is not None:
+        L = _num_hops_from_server(server)
+        active_deltas = delta_list[:L]
+    else:
+        active_deltas = delta_list
+    cascaded_error = np.prod([1 + d for d in active_deltas]) if active_deltas else 1.0
     return (client.noise_variance * client.gradient_dim / snr) * cascaded_error
 
 
-def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None):
+def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, latency_map=None):
     if not servers:
-        return 0.0
+        # Return a large finite penalty when no servers are available so that
+        # adding any feasible server reduces the objective (monotonicity),
+        # while avoiding infinities that lead to NaN arithmetic elsewhere.
+        return float(len(clients) * 1e9) if clients else 1e9
     
     total_utility = 0.0
 
@@ -26,7 +45,10 @@ def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None):
         best_cost = float('inf')
 
         for server in servers:
-            latency = client.get_latency_to(server)
+            if latency_map is not None:
+                latency = float(latency_map.get(client, {}).get(server, client.get_latency_to(server)))
+            else:
+                latency = client.get_latency_to(server)
 
             if hasattr(server, 'tier'):
                 if server.tier == 'satellite':
@@ -36,7 +58,7 @@ def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None):
 
             if snr_map is not None:
                 snr = snr_map[client].get(server, 0.0)
-                amse = compute_amse_kn_from_snr(client, snr, delta_list)
+                amse = compute_amse_kn_from_snr(client, snr, delta_list, server=server)
             else:
                 amse = compute_amse_kn(client, server, delta_list)
 
@@ -56,7 +78,6 @@ def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None):
 
             best_cost = min(best_cost, total_cost)
 
-        if best_cost < float('inf'):
-            total_utility += best_cost
+        total_utility += best_cost if best_cost < float("inf") else 1e9
 
-    return float(total_utility)
+    return total_utility

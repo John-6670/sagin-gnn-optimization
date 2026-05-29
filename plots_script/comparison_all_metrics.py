@@ -69,10 +69,12 @@ if not rows:
 
 all_df = pd.concat(rows, ignore_index=True)
 
-fig, axs = plt.subplots(2, 3, figsize=(16, 8))
+fig, axs = plt.subplots(2, 3, figsize=(16, 10))
 axs = axs.flatten()
 
 algorithms = sorted(all_df['algo'].unique(), key=lambda x: KNOWN_ALGOS.index(x))
+
+# For AMSE, we'll handle it separately with better scaling
 for algo in algorithms:
     df_a = all_df[all_df['algo'] == algo]
     grouped = df_a.groupby('step')
@@ -83,24 +85,39 @@ for algo in algorithms:
         n = grouped[m].count().reindex(mu.index).clip(lower=1)
         ci = 1.96 * std / np.sqrt(n)
 
-        axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo))
-        axs[i].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12)
-
+        # Special handling for AMSE: use log scale if there's large variance
+        if i != 2:  # AMSE is at index 1
+            axs[i].semilogy(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
+            axs[i].fill_between(mu.index.values, np.clip((mu - ci).values, 1e6, None), 
+                               np.clip((mu + ci).values, 1e6, None), alpha=0.12)
+            axs[i].set_yscale('log')
+            if i == 0:
+                axs[i].set_ylim(top=mu.max() * 50)
+        else:
+            axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
+            axs[i].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12, linewidth=1)
+    
     conv = grouped['amse'].mean().sort_index().values
-    axs[4].plot(mu.index.values, 1 / (1 + conv), label=DISPLAY_NAME.get(algo, algo))
+    axs[4].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), marker='o', markersize=1, linewidth=1)
+    axs[4].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12)
 
 
 for i, t in enumerate(['Latency', 'AMSE', 'Energy', 'CVaR@5%', 'Convergence (proxy)', '']):
-    axs[i].set_title(t)
+    axs[i].set_title(t, fontsize=11, fontweight='bold')
 
 for i in range(5):
-    axs[i].legend(fontsize=7)
-    axs[i].set_xlabel('step')
+    axs[i].legend(fontsize=8, loc='best')
+    axs[i].set_xlabel('step', fontsize=9)
+    axs[i].grid(True, alpha=0.3)
+    if i != 1:  # Don't set ylabel for log scale (it's automatic)
+        axs[i].set_ylabel('value', fontsize=9)
 
 axs[5].axis('off')
+
 plt.tight_layout()
 os.makedirs('plots', exist_ok=True)
-plt.savefig('plots/comparison_all_metrics.png', dpi=200)
+plt.savefig('plots/comparison_all_metrics.png', dpi=200, bbox_inches='tight')
+plt.close()
 
 summary = all_df.groupby('algo')[metrics].mean().sort_values('amse')
 summary.index = [DISPLAY_NAME.get(idx, idx) for idx in summary.index]
