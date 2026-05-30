@@ -169,7 +169,7 @@ def _gnn_prune_candidates(candidates, clients, kappa=0.15, checkpoint=None):
 
 
 def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, t_now=None,
-                                epsilon=0.1, alpha_cvar=0.9, N=64, coherence_time=25.0, sigma_snr=0.35,
+                                epsilon=0.15, alpha_cvar=0.05, N=64, coherence_time=25.0, sigma_snr=0.35,
                                 gnn_checkpoint=None, kappa=0.30, tau_amse=None):
     from optimization.dro import bisect_lambda_for_amse_target
     # Increase kappa from 0.15 to 0.30 to match greedy's pruning level (30% instead of 15%)

@@ -113,8 +113,8 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
         else:
             lat_vals = [c.get_latency_to(v) for c in scenarios.clients]
         avg_lat = np.mean(lat_vals)
-        # Reduce latency penalty from 0.3 to 0.05 to avoid over-penalizing high-latency servers
-        latency_penalty = 0.05 * avg_lat
+        
+        latency_penalty = 0.1 * avg_lat
         robust_gain -= latency_penalty
         logger.debug("  latency_penalty=%.6f applied (avg_lat=%.6f)", latency_penalty, avg_lat)
     

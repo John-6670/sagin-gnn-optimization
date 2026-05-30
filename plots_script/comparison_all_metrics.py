@@ -85,14 +85,13 @@ for algo in algorithms:
         n = grouped[m].count().reindex(mu.index).clip(lower=1)
         ci = 1.96 * std / np.sqrt(n)
 
-        # Special handling for AMSE: use log scale if there's large variance
-        if i != 2:  # AMSE is at index 1
+        if i != 2:
             axs[i].semilogy(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
             axs[i].fill_between(mu.index.values, np.clip((mu - ci).values, 1e6, None), 
                                np.clip((mu + ci).values, 1e6, None), alpha=0.12)
             axs[i].set_yscale('log')
             if i == 0:
-                axs[i].set_ylim(top=mu.max() * 50)
+                axs[i].set_ylim(0, mu.max())
         else:
             axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
             axs[i].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12, linewidth=1)

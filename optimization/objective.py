@@ -34,9 +34,6 @@ def compute_amse_kn_from_snr(client, snr, delta_list, server=None):
 
 def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, latency_map=None):
     if not servers:
-        # Return a large finite penalty when no servers are available so that
-        # adding any feasible server reduces the objective (monotonicity),
-        # while avoiding infinities that lead to NaN arithmetic elsewhere.
         return float(len(clients) * 1e9) if clients else 1e9
     
     total_utility = 0.0
@@ -50,11 +47,14 @@ def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, lat
             else:
                 latency = client.get_latency_to(server)
 
+            tier_multiplier = 1.0
             if hasattr(server, 'tier'):
                 if server.tier == 'satellite':
-                    latency *= 1.2
+                    tier_multiplier = 1.5
                 elif server.tier == 'uav':
-                    latency *= 1.25
+                    tier_multiplier = 1.25
+
+            latency = latency * tier_multiplier
 
             if snr_map is not None:
                 snr = snr_map[client].get(server, 0.0)
@@ -67,12 +67,7 @@ def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, lat
             if hasattr(server, 'hop_count'):
                 routing_penalty += 0.05 * server.hop_count
 
-            compound = weighted_compound_loss(
-                latency,
-                amse,
-                alpha,
-                beta,
-            )
+            compound = weighted_compound_loss(latency, amse, alpha, beta)
 
             total_cost = compound + routing_penalty
 

@@ -76,8 +76,6 @@ def dr_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_l
         beta=beta,
         delta_list=delta_list,
         t_now=t_now,
-        epsilon=0.05,
-        alpha_cvar=0.05,
         N=N,
         **kwargs,
     )

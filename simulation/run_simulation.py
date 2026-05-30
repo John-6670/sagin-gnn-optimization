@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--fl", action="store_true", help="Run FL experiments")
     parser.add_argument("--task", type=str, default=None, help="FL task to run (e.g. 'reddit_nwp', 'cifar10', 'iot_anomaly'). Runs all if omitted.")
     parser.add_argument("--results-tag", type=str, default="", help="Optional suffix tag for result CSV filenames")
+    parser.add_argument("--sensitivity", action="store_true", help="Run DRO sensitivity analysis and ablation")
     return parser.parse_args()
 
 
@@ -427,75 +428,186 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
     log.info("=== FL Experiments DONE ===")
 
 
+def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours, 
+                              time_step_seconds, outer_interval_minutes, target_snr, N,
+                              candidates=None, budget=None, cost=None, thresh=None,
+                              alpha=None, beta=None, delta_list=None):
+    """Helper to run one DRO configuration simulation"""
+    rows = []
+    ts = load.timescale()
+    start = ts.now()
+    weather = TwoStateWeatherMarkov(dt_seconds=time_step_seconds)
+
+    total_steps = int((duration_hours*3600)//time_step_seconds)
+    for step in range(total_steps):
+        t_now = start + (step*time_step_seconds)/86400.0
+        traffic = generate_spatiotemporal_traffic(clients, t_now)
+        for c in clients:
+            c.load = float(traffic.get(c.id,0.0))
+        
+        loss_db = weather.atmospheric_loss_db()
+        weather.step()
+        for n in nodes:
+            if hasattr(n,'channel_model'):
+                n.channel_model.set_weather_loss_db(loss_db)
+        
+        avg_traffic = float(np.mean([c.load for c in clients])) if clients else 0.5
+        avg_mobility = float(np.mean([np.linalg.norm(s.get_velocity_at(t_now)) for s in selected])) if selected else 0.0
+        ota = predictive_ota_control(selected, clients, t_now, target_snr, traffic=avg_traffic, mobility=avg_mobility)
+        
+        amse_vals = []
+        for s in selected:
+            snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
+            amse_vals.append(compute_amse_n(snr_dic, sigma2=10, d=100))
+        
+        lat = compute_e2e_latency(clients, selected, t_now)
+        energy = compute_total_energy(clients, ota, transmission_time=time_step_seconds)
+        amse = float(np.mean(amse_vals)) if amse_vals else 0.0
+        window_size = 30
+        losses = [r[2] for r in rows[-window_size:]] + [amse]
+        cvar_step = compute_cvar(losses, alpha=0.05)
+        rows.append((step, lat, amse, energy, cvar_step))
+        
+        # Re-selection every outer interval
+        if (step * time_step_seconds) % (outer_interval_minutes * 60) == 0 and step > 0:
+            old_selected = selected
+            selected = dr_selection(
+                candidates=candidates,
+                clients=clients,
+                budget=budget,
+                cost=cost,
+                thresh=thresh,
+                alpha=alpha,
+                beta=beta,
+                delta_list=delta_list,
+                N=N,
+                t_now=t_now
+            )
+            if len(old_selected) != len(selected):
+                log.info(f"Server re-selection at step {step}: {len(old_selected)} → {len(selected)} servers")
+    
+    csv_path = f"results/{tag}_metrics.csv"
+    with open(csv_path,'w') as f:
+        f.write('step,latency,amse,energy,cvar5\n')
+        for r in rows:
+            f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]}\n")
+    print(f"   Saved: {csv_path}")
+
+
 def run_full_sweep(
-    algorithms, nodes, clients, candidates, budget, cost, thresh, alpha, beta, delta_list,
-    duration_hours, time_step_seconds, outer_interval_minutes, target_snr, N, results_tag=""
+    algorithms, nodes, clients, candidates, budget, cost, thresh, alpha, beta, delta_list, duration_hours,
+    time_step_seconds, outer_interval_minutes, target_snr, N, results_tag="", sensitivity=False
 ):
     if os.path.exists("results"):
         log.warning("Results directory already exists. New results will be added but old files may be overwritten if names collide.")
         shutil.rmtree("results")
-    
     os.makedirs("results", exist_ok=True)
+    
     ts = load.timescale()
     start = ts.now()
     weather = TwoStateWeatherMarkov(dt_seconds=time_step_seconds)
-    for name, algo in algorithms.items():
-        rows = []
-        t_now = start  # use start time for initial selection
-        selected = algo(
-            candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
-            alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
-        )
-        total_steps = int((duration_hours*3600)//time_step_seconds)
-        for step in range(total_steps):
-            t_now = start + (step*time_step_seconds)/86400.0
-            traffic = generate_spatiotemporal_traffic(clients, t_now)
-            for c in clients:
-                c.load = float(traffic.get(c.id,0.0))
+    
+    if sensitivity:
+        log.info("Running DRO Sensitivity & Ablation Study...")
             
-            loss_db = weather.atmospheric_loss_db()
-            weather.step()
-            for n in nodes:
-                if hasattr(n,'channel_model'):
-                    n.channel_model.set_weather_loss_db(loss_db)
-            
-            avg_traffic = float(np.mean([c.load for c in clients])) if clients else 0.5
-            avg_mobility = float(np.mean([np.linalg.norm(s.get_velocity_at(t_now)) for s in selected])) if selected else 0.0
-            ota = predictive_ota_control(selected, clients, t_now, target_snr, traffic=avg_traffic, mobility=avg_mobility)
-            amse_vals = []
-            for s in selected:
-                snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
-                amse_vals.append(compute_amse_n(snr_dic, sigma2=10, d=100))
-            
-            lat = compute_e2e_latency(clients, selected, t_now)
-            energy = compute_total_energy(clients, ota, transmission_time=time_step_seconds)
-            amse = float(np.mean(amse_vals)) if amse_vals else 0.0
-            # Use rolling window of last 30 steps for CVaR (matches outer_interval_minutes)
-            window_size = 30
-            losses = [r[2] for r in rows[-window_size:]] + [amse]
-            cvar_step = compute_cvar(losses, alpha=0.05)
-            rows.append((step, lat, amse, energy, cvar_step))
-            
-            # Debug logging for energy anomalies
-            if step > 0 and step % 10 == 0:
-                avg_power = energy / len(clients) if clients else 0
-                log.debug(f"Step {step}: energy={energy:.2f}, avg_power_per_client={avg_power:.4f}, num_servers={len(selected)}, num_clients={len(clients)}")
-            
-            if (step*time_step_seconds)%(outer_interval_minutes*60) == 0 and step > 0:
-                old_selected = selected
-                selected = algo(
-                    candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
-                    alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
-                )
-                if len(old_selected) != len(selected):
-                    log.info(f"Server re-selection at step {step}: {len(old_selected)} → {len(selected)} servers")
+        dr_algo = algorithms['dr_greedy']
         
-        tag = f"_{results_tag}" if results_tag else ""
-        csv_path = f"results/{name}{tag}_metrics.csv"
-        with open(csv_path,'w') as f:
-            f.write('step,latency,amse,energy,cvar5\n')
-            for r in rows:
-                f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]}\n")
+        # Sensitivity Analysis
+        sensitivity_cases = [
+            ("budget_20", 20, N, 0.1, 0.3), ("budget_30", 30, N, 0.1, 0.3), ("budget_40", 40, N, 0.1, 0.3),
+            ("N_32", budget, 32, 0.1, 0.3), ("N_64", budget, 64, 0.1, 0.3),
+            ("eps_005", budget, N, 0.05, 0.3), ("eps_015", budget, N, 0.15, 0.3),
+            ("kappa_015", budget, N, 0.1, 0.15), ("kappa_030", budget, N, 0.1, 0.30),
+        ]
+
+        for tag, b, n_scen, eps, kap in sensitivity_cases:
+            print(f"→ DRO Sensitivity: {tag}")
+            selected = dr_algo(
+                candidates=candidates, clients=clients, budget=b, cost=cost,
+                thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list,
+                N=n_scen, t_now=start, epsilon=eps, kappa=kap
+            )
+            _run_single_dro_simulation(
+                selected, clients, nodes, f"dr_sensitivity_{tag}",
+                duration_hours, time_step_seconds, outer_interval_minutes, target_snr, n_scen,
+                candidates=candidates, budget=b, cost=cost, thresh=thresh,
+                alpha=alpha, beta=beta, delta_list=delta_list
+            )
+
+        # Ablation Study
+        ablation_cases = {
+            "full":      lambda: dr_algo(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N=N, epsilon=0.1, kappa=0.3, t_now=start),
+            "no_gnn":    lambda: dr_algo(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N=N, epsilon=0.1, kappa=1.0, t_now=start),
+            "no_swap":   lambda: dr_algo(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N=N, epsilon=0.1, kappa=0.3, t_now=start)[:budget],  # skip local swap
+        }
+
+        for name, sel_func in ablation_cases.items():
+            print(f"→ DRO Ablation: {name}")
+            selected = sel_func()
+            _run_single_dro_simulation(
+                selected, clients, nodes, f"dr_ablation_{name}",
+                duration_hours, time_step_seconds, outer_interval_minutes, target_snr, N,
+                candidates=candidates, budget=budget, cost=cost, thresh=thresh,
+                alpha=alpha, beta=beta, delta_list=delta_list
+            )
+    else:
+        for name, algo in algorithms.items():
+            rows = []
+            t_now = start  # use start time for initial selection
+            selected = algo(
+                candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+                alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
+            )
+            total_steps = int((duration_hours*3600)//time_step_seconds)
+            for step in range(total_steps):
+                t_now = start + (step*time_step_seconds)/86400.0
+                traffic = generate_spatiotemporal_traffic(clients, t_now)
+                for c in clients:
+                    c.load = float(traffic.get(c.id,0.0))
+                    
+                loss_db = weather.atmospheric_loss_db()
+                weather.step()
+                for n in nodes:
+                    if hasattr(n,'channel_model'):
+                        n.channel_model.set_weather_loss_db(loss_db)
+                    
+                avg_traffic = float(np.mean([c.load for c in clients])) if clients else 0.5
+                avg_mobility = float(np.mean([np.linalg.norm(s.get_velocity_at(t_now)) for s in selected])) if selected else 0.0
+                ota = predictive_ota_control(selected, clients, t_now, target_snr, traffic=avg_traffic, mobility=avg_mobility)
+                amse_vals = []
+                for s in selected:
+                    snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
+                    amse_vals.append(compute_amse_n(snr_dic, sigma2=10, d=100))
+                    
+                lat = compute_e2e_latency(clients, selected, t_now)
+                energy = compute_total_energy(clients, ota, transmission_time=time_step_seconds)
+                amse = float(np.mean(amse_vals)) if amse_vals else 0.0
+                # Use rolling window of last 30 steps for CVaR (matches outer_interval_minutes)
+                window_size = 30
+                losses = [r[2] for r in rows[-window_size:]] + [amse]
+                cvar_step = compute_cvar(losses, alpha=0.05)
+                rows.append((step, lat, amse, energy, cvar_step))
+                    
+                # Debug logging for energy anomalies
+                if step > 0 and step % 10 == 0:
+                    avg_power = energy / len(clients) if clients else 0
+                    log.debug(f"Step {step}: energy={energy:.2f}, avg_power_per_client={avg_power:.4f}, num_servers={len(selected)}, num_clients={len(clients)}")
+                    
+                if (step*time_step_seconds)%(outer_interval_minutes*60) == 0 and step > 0:
+                    old_selected = selected
+                    selected = algo(
+                        candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+                        alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
+                    )
+                    if len(old_selected) != len(selected):
+                        log.info(f"Server re-selection at step {step}: {len(old_selected)} → {len(selected)} servers")
+                
+            tag = f"_{results_tag}" if results_tag else ""
+            csv_path = f"results/{name}{tag}_metrics.csv"
+            with open(csv_path,'w') as f:
+                f.write('step,latency,amse,energy,cvar5\n')
+                for r in rows:
+                    f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]}\n")
 
 
 def main():
@@ -596,6 +708,7 @@ def main():
             target_snr=target_snr,
             N=num_scenarios,
             results_tag=args.results_tag,
+            sensitivity=args.sensitivity,
         )
 
     if alg in ['all', 'test']:
