@@ -517,7 +517,7 @@ def run_full_sweep(
             ("budget_20", 20, N, 0.1, 0.3), ("budget_30", 30, N, 0.1, 0.3), ("budget_40", 40, N, 0.1, 0.3),
             ("N_32", budget, 32, 0.1, 0.3), ("N_64", budget, 64, 0.1, 0.3),
             ("eps_005", budget, N, 0.05, 0.3), ("eps_015", budget, N, 0.15, 0.3),
-            ("kappa_015", budget, N, 0.1, 0.15), ("kappa_030", budget, N, 0.1, 0.30),
+            ("kappa_015", budget, N, 0.1, 0.15), ("kappa_030", budget, N, 0.1, 0.30)
         ]
 
         for tag, b, n_scen, eps, kap in sensitivity_cases:
@@ -644,10 +644,10 @@ def main():
     algorithms = {
         "greedy": greedy_server_selection,
         "dr_greedy": dr_selection,
-        "lop": lop_selection,
-        "go": go_selection,
-        "nrs": nrs_selection,
-        "random": random_selection,
+        # "lop": lop_selection,
+        # "go": go_selection,
+        # "nrs": nrs_selection,
+        # "random": random_selection,
     }
 
     log.info("Simulation params: sats=%d  uavs=%d  ground=%d  clients=%d  area=%d  gradient_dim=%d  sigma2=%s",

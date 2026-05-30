@@ -69,7 +69,7 @@ if not rows:
 
 all_df = pd.concat(rows, ignore_index=True)
 
-fig, axs = plt.subplots(2, 3, figsize=(16, 10))
+fig, axs = plt.subplots(2, 2, figsize=(16, 10))
 axs = axs.flatten()
 
 algorithms = sorted(all_df['algo'].unique(), key=lambda x: KNOWN_ALGOS.index(x))
@@ -91,27 +91,22 @@ for algo in algorithms:
                                np.clip((mu + ci).values, 1e6, None), alpha=0.12)
             axs[i].set_yscale('log')
             if i == 0:
-                axs[i].set_ylim(0, mu.max())
+                axs[i].set_yscale('log')
+                axs[i].set_ylim(mu.min() * 0.8, mu.max() * 1.2)
         else:
             axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
             axs[i].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12, linewidth=1)
-    
-    conv = grouped['amse'].mean().sort_index().values
-    axs[4].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), marker='o', markersize=1, linewidth=1)
-    axs[4].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12)
 
 
-for i, t in enumerate(['Latency', 'AMSE', 'Energy', 'CVaR@5%', 'Convergence (proxy)', '']):
+for i, t in enumerate(['Latency', 'AMSE', 'Energy', 'CVaR@5%']):
     axs[i].set_title(t, fontsize=11, fontweight='bold')
 
-for i in range(5):
+for i in range(4):
     axs[i].legend(fontsize=8, loc='best')
     axs[i].set_xlabel('step', fontsize=9)
     axs[i].grid(True, alpha=0.3)
     if i != 1:  # Don't set ylabel for log scale (it's automatic)
         axs[i].set_ylabel('value', fontsize=9)
-
-axs[5].axis('off')
 
 plt.tight_layout()
 os.makedirs('plots', exist_ok=True)

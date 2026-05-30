@@ -10,13 +10,13 @@ simulation:
   num_scenarios: 8
 
   # Dynamic Simulation Parameters
-  duration_hours: 2         # Total simulation time
+  duration_hours: 6         # Total simulation time
   time_step_seconds: 60       # Inner loop execution frequency (Fast timescale)
   outer_interval_minutes: 30  # Outer loop execution frequency (Slow timescale)
 
 algorithm:
-  alpha: 0.8
-  beta: 0.2
+  alpha: 0.5
+  beta: 0.5
   budget: 30
   delta_list:
     - 0.1

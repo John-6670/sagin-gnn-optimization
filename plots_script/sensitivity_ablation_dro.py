@@ -12,7 +12,9 @@ def load_dro_results(name):
     dfs = []
     for f in files:
         df = pd.read_csv(f)
+        print(os.path.basename(f))
         tag = os.path.basename(f).replace('dr_sensitivity_', '').replace('_metrics.csv', '').replace('dr_ablation_', '')
+        print(f"  tag={tag}")
         df['variant'] = tag
         dfs.append(df)
     return pd.concat(dfs, ignore_index=True)

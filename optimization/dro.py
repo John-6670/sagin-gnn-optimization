@@ -107,17 +107,6 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
 
     robust_gain = cvar - penalty
     
-    if S:
-        if getattr(scenarios, 'latency_map', None) is not None:
-            lat_vals = [scenarios.latency_map.get(c, {}).get(v, c.get_latency_to(v)) for c in scenarios.clients]
-        else:
-            lat_vals = [c.get_latency_to(v) for c in scenarios.clients]
-        avg_lat = np.mean(lat_vals)
-        
-        latency_penalty = 0.1 * avg_lat
-        robust_gain -= latency_penalty
-        logger.debug("  latency_penalty=%.6f applied (avg_lat=%.6f)", latency_penalty, avg_lat)
-    
     if robust_gain < 1e-6 and mean_gain > 0:
         robust_gain = mean_gain * 0.7
 
