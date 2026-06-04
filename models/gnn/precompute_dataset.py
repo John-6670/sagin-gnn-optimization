@@ -4,7 +4,7 @@ from models.gnn.dataset import get_gnn_datasets
 import torch
 import os
 
-train_ds, val_ds, test_ds = get_gnn_datasets(num_samples=42, seed=42)
+train_ds, val_ds, test_ds = get_gnn_datasets(num_samples=14000, seed=42)
 
 output_dir = "precomputed_dataset"
 if os.path.exists(output_dir):

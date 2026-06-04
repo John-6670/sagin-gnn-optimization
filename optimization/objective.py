@@ -138,6 +138,5 @@ def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, lat
         fl_penalty += 0.8 * final_loss + 0.5 * mean_amse
 
     final_utility = total_utility + fl_penalty
-    logger.info(f"Utility Summary: base={total_utility:.5f}, fl_penalty={fl_penalty:.5f}, total={final_utility:.5f}")
     
     return final_utility

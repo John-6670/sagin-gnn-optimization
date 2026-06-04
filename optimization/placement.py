@@ -200,8 +200,8 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
                                 gnn_checkpoint=None, kappa=0.5, tau_amse=None):
     from optimization.dro import bisect_lambda_for_amse_target
     # Increase kappa from 0.15 to 0.30 to match greedy's pruning level (30% instead of 15%)
-    # C = _gnn_prune_candidates(candidates, clients, kappa=kappa, checkpoint=gnn_checkpoint)
-    C = candidates.copy()
+    C = _gnn_prune_candidates(candidates, clients, kappa=kappa, checkpoint=gnn_checkpoint)
+    # C = candidates.copy()
     for c in C:
         print(f"Candidate {c.id} | Type: {c.type} | Cost: {cost[c]:.2f}")
     scenario_maps = sample_snr_scenarios(clients, C, t_now, N=N,
@@ -215,15 +215,12 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
     
     S, total_cost, remaining = [], 0.0, list(C)   
     while remaining:
-        print(f"DR-Greedy: Evaluating {len(remaining)} remaining candidates with current cost {total_cost:.2f}")
         best_v, best_score = None, -float('inf')
         for v in remaining:
             if total_cost + cost[v] > budget:
                 continue
             
-            print(f"  Evaluating candidate {v.id} with cost {cost[v]:.2f}")
             score, _ = robust_marginal_gain(S, v, bundle, epsilon=epsilon, alpha_cvar=alpha_cvar)
-            print(f"    Robust marginal gain for candidate {v.id}: {score:.4f}")
             if score > best_score:
                 best_score, best_v = score, v
         # Stop only when no feasible server exists or gain is genuinely negative

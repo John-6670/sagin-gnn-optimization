@@ -140,11 +140,10 @@ class SAGINSnapshotDataset(Dataset):
         for idx in range(self.num_samples):            
             print(f"[Dataset] processing sample {idx}/{self.num_samples}")
             
-            p = self.lhs[idx]
-            clients_n = 125
+            clients_n = 500
 
             nodes = generate_nodes(
-                num_sats=9, num_uavs=2, num_ground=5, 
+                num_sats=36, num_uavs=8, num_ground=20, 
                 num_clients=clients_n, 
                 area_size=self.area_size, 
                 gradient_dim=self.gradient_dim
