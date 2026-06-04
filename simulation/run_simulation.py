@@ -1,15 +1,24 @@
 import argparse
 from typing import List, Dict
-from collections import defaultdict
 import numpy as np
 from matplotlib import pyplot as plt
 import os
 import shutil
 import logging
-from datetime import datetime
-from skyfield.api import load, utc
+from skyfield.api import load
 
 from simulation.config_loader import load_config
+from simulation.topology.nodes import Node, NodeType, generate_nodes
+from simulation.topology.aircomp import compute_amse_n
+from simulation.topology.patching import hybrid_patch
+from simulation.traffic.traffic_generator import generate_spatiotemporal_traffic
+from simulation.environment.weather import TwoStateWeatherMarkov
+from simulation.evaluation.metrics import compute_e2e_latency, compute_total_energy, compute_cvar
+from optimization.placement import predictive_ota_control
+from optimization.baselines import da_selection, lop_selection, go_selection, nrs_selection, random_selection, dr_selection
+from fl.tasks import get_task_registry
+from fl.trainer import FederatedRound
+from fl.convergence import convergence_monitor
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -20,17 +29,6 @@ logging.basicConfig(
 for _noisy in ("PIL", "matplotlib", "urllib3", "filelock"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("run_simulation")
-from simulation.topology.nodes import Node, NodeType, generate_nodes
-from simulation.topology.aircomp import compute_amse_kn, compute_amse_n
-from simulation.topology.patching import hybrid_patch
-from simulation.traffic.traffic_generator import generate_spatiotemporal_traffic
-from simulation.environment.weather import TwoStateWeatherMarkov
-from simulation.evaluation.metrics import compute_e2e_latency, compute_total_energy, compute_cvar
-from optimization.placement import greedy_server_selection, predictive_ota_control
-from optimization.baselines import lop_selection, go_selection, nrs_selection, random_selection, dr_selection
-from fl.tasks import get_task_registry
-from fl.trainer import FederatedRound
-from fl.convergence import convergence_monitor
 
 
 def parse_args():
@@ -55,14 +53,8 @@ def summarize_selection(selected_servers: List[Node], t_now=None) -> str:
     return "\n".join(lines)
 
 
-# Cost model (simple for now)
 def build_costs(servers: List[Node]) -> Dict[Node, float]:
-    """
-    Simple cost model:
-    - satellite > uav > ground
-    """
     cost = {}
-
     for s in servers:
         if s.type == NodeType.SATELLITE:
             cost[s] = 10.0
@@ -70,7 +62,6 @@ def build_costs(servers: List[Node]) -> Dict[Node, float]:
             cost[s] = 5.0
         else:
             cost[s] = 1.0
-
     return cost
 
 
@@ -354,48 +345,112 @@ def plot_comparison_amse_kn(total_avg, total_min, total_max, output_dir="plots")
     plt.close(fig)
 
 
+# def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots", task_filter=None):
+#     os.makedirs(output_dir, exist_ok=True)
+#     all_tasks = get_task_registry()
+#     if task_filter:
+#         if task_filter not in all_tasks:
+#             raise ValueError(f"Unknown task '{task_filter}'. Available: {list(all_tasks.keys())}")
+#         tasks = {task_filter: all_tasks[task_filter]}
+#     else:
+#         tasks = all_tasks
+#     log.info("=== FL Experiments START | tasks=%s | algorithms=%s | clients=%d | candidates=%d | budget=%d ===",
+#              list(tasks.keys()), list(algorithms.keys()), len(clients), len(candidates), budget)
+#     for task_name, task in tasks.items():
+#         log.info("--- FL Task: %s | local_epochs=%d | lr=%s | optimizer=%s ---",
+#                  task_name, task.local_epochs, task.lr, task.optimizer)
+#         log.debug("  Loading data loaders for %d clients (seed=123)...", len(clients))
+#         client_loaders, test_loader = task.get_data_loaders(len(clients), seed=123)
+#         log.debug("  Data loaders ready.")
+#         for alg_name, algo in algorithms.items():
+#             log.info("  [%s / %s] Running server selection...", task_name, alg_name)
+#             selected = algo(
+#                 candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+#                 alpha=alpha, beta=beta, delta_list=delta_list
+#             )
+#             if not selected:
+#                 log.warning("  [%s / %s] No servers selected — skipping.", task_name, alg_name)
+#                 continue
+#             log.info("  [%s / %s] Selected %d server(s): %s",
+#                      task_name, alg_name, len(selected),
+#                      [(s.id, s.type.value) for s in selected])
+
+#             model = task.get_model()
+#             log.debug("  [%s / %s] Model built: %s", task_name, alg_name, type(model).__name__)
+#             amse_hist = []
+#             loss_hist = []
+#             acc_hist = []
+#             num_rounds = 12
+#             for r in range(num_rounds):
+#                 log.info("  [%s / %s] Round %2d/%d — computing SNR map...", task_name, alg_name, r+1, num_rounds)
+#                 snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in clients}
+#                 snr_vals = [list(v.values())[0] for v in snr_map.values()]
+#                 log.debug("    SNR stats: min=%.3e  max=%.3e  mean=%.3e",
+#                           min(snr_vals), max(snr_vals), float(np.mean(snr_vals)))
+#                 res = FederatedRound(
+#                     r, clients, selected, {}, task, model, client_loaders,
+#                     test_loader, snr_map, delta_list, use_hybrid=True
+#                 )
+#                 amse_hist.append(res['amse'])
+#                 loss_hist.append(res['loss'])
+#                 acc_hist.append(res['accuracy'])
+#                 log.info("    Round %2d result: active=%d  p_t=%.3f  amse=%.6f  loss=%.6f  acc=%.4f",
+#                          r+1, res['active_clients'], res['p_t'], res['amse'], res['loss'], res['accuracy'])
+
+#             _, logs = convergence_monitor(amse_hist, loss_hist, sigma2=1.0, rho=0.95, gamma=0.5)
+#             log.info("  [%s / %s] Convergence summary — final bound=%.6f  final acc=%.4f  final loss=%.6f",
+#                      task_name, alg_name, logs[-1]['theoretical_bound'], acc_hist[-1], loss_hist[-1])
+#             x = np.arange(1, len(acc_hist)+1)
+#             fig, ax = plt.subplots(figsize=(8,4))
+#             ax.plot(x, acc_hist, label='accuracy')
+#             ax2 = ax.twinx()
+#             ax2.plot(x, [l['theoretical_bound'] for l in logs], color='r', label='bound')
+#             ax.set_title(f"FL {task_name} - {alg_name}")
+#             ax.set_xlabel('round')
+#             ax.set_ylabel('acc')
+#             ax2.set_ylabel('bound')
+#             plt.legend()
+#             fig.legend()
+#             fig.tight_layout()
+#             plot_path = os.path.join(output_dir, f"fl_{task_name}_{alg_name}.png")
+#             fig.savefig(plot_path, dpi=200)
+#             plt.close(fig)
+#             log.info("  [%s / %s] Plot saved: %s", task_name, alg_name, plot_path)
+#     log.info("=== FL Experiments DONE ===")
+
+
 def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots", task_filter=None):
     os.makedirs(output_dir, exist_ok=True)
     all_tasks = get_task_registry()
     if task_filter:
-        if task_filter not in all_tasks:
-            raise ValueError(f"Unknown task '{task_filter}'. Available: {list(all_tasks.keys())}")
         tasks = {task_filter: all_tasks[task_filter]}
     else:
         tasks = all_tasks
-    log.info("=== FL Experiments START | tasks=%s | algorithms=%s | clients=%d | candidates=%d | budget=%d ===",
-             list(tasks.keys()), list(algorithms.keys()), len(clients), len(candidates), budget)
-    for task_name, task in tasks.items():
-        log.info("--- FL Task: %s | local_epochs=%d | lr=%s | optimizer=%s ---",
-                 task_name, task.local_epochs, task.lr, task.optimizer)
-        log.debug("  Loading data loaders for %d clients (seed=123)...", len(clients))
-        client_loaders, test_loader = task.get_data_loaders(len(clients), seed=123)
-        log.debug("  Data loaders ready.")
-        for alg_name, algo in algorithms.items():
-            log.info("  [%s / %s] Running server selection...", task_name, alg_name)
-            selected = algo(
-                candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
-                alpha=alpha, beta=beta, delta_list=delta_list
-            )
-            if not selected:
-                log.warning("  [%s / %s] No servers selected — skipping.", task_name, alg_name)
-                continue
-            log.info("  [%s / %s] Selected %d server(s): %s",
-                     task_name, alg_name, len(selected),
-                     [(s.id, s.type.value) for s in selected])
 
+    for task_name, task in tasks.items():
+        log.info(f"--- FL Task: {task_name} ---")
+        client_loaders, test_loader = task.get_data_loaders(len(clients), seed=123)
+
+        for alg_name, algo in algorithms.items():
+            log.info(f"[{alg_name}] Running server placement...")
+            selected = algo(
+                candidates=candidates, clients=clients, budget=budget, cost=cost,
+                thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list
+            )
+
+            if not selected:
+                log.warning(f"[{alg_name}] No servers selected.")
+                continue
+
+            log.info(f"[{alg_name}] Selected {len(selected)} servers")
+
+            # === Run full FL training ===
             model = task.get_model()
-            log.debug("  [%s / %s] Model built: %s", task_name, alg_name, type(model).__name__)
-            amse_hist = []
-            loss_hist = []
-            acc_hist = []
+            amse_hist, loss_hist, acc_hist = [], [], []
             num_rounds = 12
+
             for r in range(num_rounds):
-                log.info("  [%s / %s] Round %2d/%d — computing SNR map...", task_name, alg_name, r+1, num_rounds)
                 snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in clients}
-                snr_vals = [list(v.values())[0] for v in snr_map.values()]
-                log.debug("    SNR stats: min=%.3e  max=%.3e  mean=%.3e",
-                          min(snr_vals), max(snr_vals), float(np.mean(snr_vals)))
                 res = FederatedRound(
                     r, clients, selected, {}, task, model, client_loaders,
                     test_loader, snr_map, delta_list, use_hybrid=True
@@ -403,28 +458,34 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
                 amse_hist.append(res['amse'])
                 loss_hist.append(res['loss'])
                 acc_hist.append(res['accuracy'])
-                log.info("    Round %2d result: active=%d  p_t=%.3f  amse=%.6f  loss=%.6f  acc=%.4f",
-                         r+1, res['active_clients'], res['p_t'], res['amse'], res['loss'], res['accuracy'])
 
-            _, logs = convergence_monitor(amse_hist, loss_hist, sigma2=1.0, rho=0.95, gamma=0.5)
-            log.info("  [%s / %s] Convergence summary — final bound=%.6f  final acc=%.4f  final loss=%.6f",
-                     task_name, alg_name, logs[-1]['theoretical_bound'], acc_hist[-1], loss_hist[-1])
+            final_bound, logs = convergence_monitor(amse_hist, loss_hist, sigma2=1.0, rho=0.95, gamma=0.5)
+            
+            fl_feedback = {
+                'final_loss': logs[-1]['loss'],
+                'final_accuracy': acc_hist[-1],
+                'mean_amse': np.mean(amse_hist),
+                'final_bound': final_bound
+            }
+
+            log.info(f"[{alg_name}] FL Result → Acc: {acc_hist[-1]:.4f} | Mean AMSE: {fl_feedback['mean_amse']:.6f} | Bound: {final_bound:.4f}")
+
+            # Plot
             x = np.arange(1, len(acc_hist)+1)
             fig, ax = plt.subplots(figsize=(8,4))
-            ax.plot(x, acc_hist, label='accuracy')
+            ax.plot(x, acc_hist, label='Accuracy')
             ax2 = ax.twinx()
-            ax2.plot(x, [l['theoretical_bound'] for l in logs], color='r', label='bound')
+            ax2.plot(x, [l['theoretical_bound'] for l in logs], color='r', label='Theoretical Bound')
             ax.set_title(f"FL {task_name} - {alg_name}")
-            ax.set_xlabel('round')
-            ax.set_ylabel('acc')
-            ax2.set_ylabel('bound')
-            plt.legend()
+            ax.set_xlabel('Round')
+            ax.set_ylabel('Accuracy')
+            ax2.set_ylabel('Bound')
             fig.legend()
             fig.tight_layout()
             plot_path = os.path.join(output_dir, f"fl_{task_name}_{alg_name}.png")
             fig.savefig(plot_path, dpi=200)
             plt.close(fig)
-            log.info("  [%s / %s] Plot saved: %s", task_name, alg_name, plot_path)
+
     log.info("=== FL Experiments DONE ===")
 
 
@@ -437,6 +498,8 @@ def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours,
     ts = load.timescale()
     start = ts.now()
     weather = TwoStateWeatherMarkov(dt_seconds=time_step_seconds)
+    
+    print(start, [s.id for s in selected])
 
     total_steps = int((duration_hours*3600)//time_step_seconds)
     for step in range(total_steps):
@@ -461,11 +524,12 @@ def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours,
             amse_vals.append(compute_amse_n(snr_dic, sigma2=10, d=100))
         
         lat = compute_e2e_latency(clients, selected, t_now)
-        energy = compute_total_energy(clients, ota, transmission_time=time_step_seconds)
+        energy = compute_total_energy(clients, selected, ota, transmission_time=time_step_seconds, t_now=t_now)
         amse = float(np.mean(amse_vals)) if amse_vals else 0.0
         window_size = 30
-        losses = [r[2] for r in rows[-window_size:]] + [amse]
-        cvar_step = compute_cvar(losses, alpha=0.05)
+        # CVaR computed on past window only (exclude current step to avoid trending up with AMSE)
+        losses = [r[2] for r in rows[-window_size:]]
+        cvar_step = compute_cvar(losses, alpha=0.05) if losses else amse
         rows.append((step, lat, amse, energy, cvar_step))
         
         # Re-selection every outer interval
@@ -483,6 +547,7 @@ def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours,
                 N=N,
                 t_now=t_now
             )
+            print(t_now, [s.id for s in selected])
             if len(old_selected) != len(selected):
                 log.info(f"Server re-selection at step {step}: {len(old_selected)} → {len(selected)} servers")
     
@@ -514,17 +579,18 @@ def run_full_sweep(
         
         # Sensitivity Analysis
         sensitivity_cases = [
-            ("budget_20", 20, N, 0.1, 0.3), ("budget_30", 30, N, 0.1, 0.3), ("budget_40", 40, N, 0.1, 0.3),
-            ("N_32", budget, 32, 0.1, 0.3), ("N_64", budget, 64, 0.1, 0.3),
-            ("eps_005", budget, N, 0.05, 0.3), ("eps_015", budget, N, 0.15, 0.3),
-            ("kappa_015", budget, N, 0.1, 0.15), ("kappa_030", budget, N, 0.1, 0.30)
+            ("budget_20", 20, N, 0.1, 0.3, alpha), ("budget_30", 30, N, 0.1, 0.3, alpha), ("budget_40", 40, N, 0.1, 0.3, alpha),
+            ("N_8", budget, 8, 0.1, 0.3, alpha), ("N_32", budget, 32, 0.1, 0.3, alpha), ("N_64", budget, 64, 0.1, 0.3, alpha),
+            ("eps_005", budget, N, 0.05, 0.3, alpha), ("eps_015", budget, N, 0.15, 0.3, alpha),
+            ("kappa_015", budget, N, 0.1, 0.15, alpha), ("kappa_030", budget, N, 0.1, 0.30, alpha), ("kappa_060", budget, N, 0.1, 0.60, alpha),
+            ("alpha_01", budget, N, 0.1, 0.3, 0.1), ("alpha_05", budget, N, 0.1, 0.3, 0.5), ("alpha_1", budget, N, 1.0, 0.3, 1.0),
         ]
 
-        for tag, b, n_scen, eps, kap in sensitivity_cases:
+        for tag, b, n_scen, eps, kap, alp in sensitivity_cases:
             print(f"→ DRO Sensitivity: {tag}")
             selected = dr_algo(
                 candidates=candidates, clients=clients, budget=b, cost=cost,
-                thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list,
+                thresh=thresh, alpha=alp, beta=beta, delta_list=delta_list,
                 N=n_scen, t_now=start, epsilon=eps, kappa=kap
             )
             _run_single_dro_simulation(
@@ -552,6 +618,7 @@ def run_full_sweep(
             )
     else:
         for name, algo in algorithms.items():
+            log.info("Running simulation for algorithm: %s", name)
             rows = []
             t_now = start  # use start time for initial selection
             selected = algo(
@@ -574,19 +641,25 @@ def run_full_sweep(
                 avg_traffic = float(np.mean([c.load for c in clients])) if clients else 0.5
                 avg_mobility = float(np.mean([np.linalg.norm(s.get_velocity_at(t_now)) for s in selected])) if selected else 0.0
                 ota = predictive_ota_control(selected, clients, t_now, target_snr, traffic=avg_traffic, mobility=avg_mobility)
+    
                 amse_vals = []
                 for s in selected:
                     snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
                     amse_vals.append(compute_amse_n(snr_dic, sigma2=10, d=100))
                     
                 lat = compute_e2e_latency(clients, selected, t_now)
-                energy = compute_total_energy(clients, ota, transmission_time=time_step_seconds)
+                energy = compute_total_energy(clients, selected, ota, transmission_time=time_step_seconds, t_now=t_now)
+                if step % 5 == 0 or step == 0:
+                    print(f"Step {step:3d} | Algo: {name if 'name' in locals() else 'DRO'} | "
+                        f"Servers: {len(selected)} | Energy: {energy:.4f}")
+                
                 amse = float(np.mean(amse_vals)) if amse_vals else 0.0
                 # Use rolling window of last 30 steps for CVaR (matches outer_interval_minutes)
                 window_size = 30
                 losses = [r[2] for r in rows[-window_size:]] + [amse]
                 cvar_step = compute_cvar(losses, alpha=0.05)
                 rows.append((step, lat, amse, energy, cvar_step))
+                print('Step {}: latency={:.2f}s, amse={:.6f}, energy={:.2f}J, CVaR5%={:.6f}'.format(step, lat, amse, energy, cvar_step))
                     
                 # Debug logging for energy anomalies
                 if step > 0 and step % 10 == 0:
@@ -601,7 +674,11 @@ def run_full_sweep(
                     )
                     if len(old_selected) != len(selected):
                         log.info(f"Server re-selection at step {step}: {len(old_selected)} → {len(selected)} servers")
-                
+            
+            print('--- Algorithm {} choosed following servers at last time step ---'.format(name))
+            for s in selected:
+                print(f"Server {s.id} ({s.type.value}) at position {s.position.tolist()}")
+            
             tag = f"_{results_tag}" if results_tag else ""
             csv_path = f"results/{name}{tag}_metrics.csv"
             with open(csv_path,'w') as f:
@@ -615,9 +692,11 @@ def main():
     log.info("=== SAGIN Simulation START ===")
     log.info("Args: config=%s  algorithm=%s  fl=%s  seed=%s  budget=%s",
              args.config, args.algorithm, args.fl, args.seed, args.budget)
+
     config = load_config(args.config)
     log.info("Config loaded from %s", args.config)
 
+    # ====================== Config Parameters ======================
     num_sats = config["simulation"].get("num_sats", 1)
     num_uavs = config["simulation"].get("num_uavs", 2)
     num_ground = config["simulation"].get("num_ground", 4)
@@ -625,7 +704,8 @@ def main():
     area_size = config["simulation"].get("area_size", 2000)
     gradient_dim = config['simulation'].get('gradient_dim', 100)
     sigma2 = config['simulation'].get('sigma2', 10)
-    alg = args.algorithm or config['simulation'].get('algorithm', 'all')
+
+    alg_param = args.algorithm or config['simulation'].get('algorithm', 'all')
     duration_hours = config["simulation"].get("duration_hours", 0.0)
     time_step_seconds = config["simulation"].get("time_step_seconds", 10)
     outer_interval_minutes = config["simulation"].get("outer_interval_minutes", 30)
@@ -635,30 +715,37 @@ def main():
     beta = config["algorithm"].get("beta", 0.5)
     delta_list = config["algorithm"].get("delta_list", [0.1, 0.2])
     target_snr = config["algorithm"].get("target_snr", 10.0)
-
     budget = args.budget or config["algorithm"].get("budget", 20)
-
     thresh = config["algorithm"].get("snr_threshold", 0.0)
-    
 
+    # ====================== Algorithms Dictionary ======================
     algorithms = {
-        "greedy": greedy_server_selection,
+        "lop": lop_selection,
+        "go": go_selection,
+        "nrs": nrs_selection,
+        "random": random_selection,
+        "da": da_selection,
         "dr_greedy": dr_selection,
-        # "lop": lop_selection,
-        # "go": go_selection,
-        # "nrs": nrs_selection,
-        # "random": random_selection,
     }
 
-    log.info("Simulation params: sats=%d  uavs=%d  ground=%d  clients=%d  area=%d  gradient_dim=%d  sigma2=%s",
-             num_sats, num_uavs, num_ground, num_clients, area_size, gradient_dim, sigma2)
-    log.info("Algorithm params: alg=%s  budget=%d  alpha=%s  beta=%s  thresh=%s  target_snr=%s  delta_list=%s  num_scenarios=%s",
-             alg, budget, alpha, beta, thresh, target_snr, delta_list, num_scenarios)
+    # Decide which algorithms to run
+    if alg_param in ['all', 'test']:
+        active_algorithms = algorithms
+        log.info("Running ALL algorithms (test/all mode)")
+    else:
+        if alg_param not in algorithms:
+            raise ValueError(f"Unknown algorithm '{alg_param}'. Available: {list(algorithms.keys())}")
+        active_algorithms = {alg_param: algorithms[alg_param]}
+        log.info(f"Running single algorithm: {alg_param}")
+
+    log.info("Simulation params: sats=%d uavs=%d ground=%d clients=%d area=%d duration=%.1fh",
+             num_sats, num_uavs, num_ground, num_clients, area_size, duration_hours)
 
     if args.seed is not None:
         np.random.seed(args.seed)
         log.info("Random seed set to %d", args.seed)
 
+    # ====================== Generate Nodes ======================
     ts = load.timescale()
     start = ts.now()
 
@@ -675,24 +762,23 @@ def main():
 
     clients = [n for n in nodes if n.type == NodeType.CLIENT]
     candidates = [n for n in nodes if n.type != NodeType.CLIENT]
-    n_can = len(candidates)
-    g_can = len([n for n in candidates if n.type == NodeType.GROUND])
-    log.info("Nodes generated: total=%d  clients=%d  candidates=%d  (sats=%d  uavs=%d  ground=%d)",
-             len(nodes), len(clients), n_can,
-             sum(1 for n in candidates if n.type == NodeType.SATELLITE),
-             sum(1 for n in candidates if n.type == NodeType.UAV),
-             g_can)
 
     cost = build_costs(candidates)
-    log.debug("Costs built: %s", {n.id: c for n, c in cost.items()})
 
+    # ====================== FL Experiments ======================
     if args.fl:
-        log.info("--- FL flag set: launching run_fl_experiments ---")
-        run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots", task_filter=args.task)
+        log.info("--- FL Experiments Mode ---")
+        run_fl_experiments(
+            active_algorithms, candidates, clients, budget, cost, thresh,
+            alpha, beta, delta_list, output_dir="plots", task_filter=args.task
+        )
 
+    # ====================== Main Simulation Logic ======================
     if duration_hours > 0:
+        # Dynamic simulation with time evolution
+        log.info(f"Running FULL DYNAMIC SWEEP (duration = {duration_hours}h)")
         run_full_sweep(
-            algorithms=algorithms,
+            algorithms=active_algorithms,
             nodes=nodes,
             clients=clients,
             candidates=candidates,
@@ -710,14 +796,16 @@ def main():
             results_tag=args.results_tag,
             sensitivity=args.sensitivity,
         )
-
-    if alg in ['all', 'test']:
+    else:
+        # Static test mode (single placement + metrics)
+        log.info("Running STATIC TEST mode (duration=0)")
         total_amse_n = {}
         total_amse_kn_avg = {}
-        total_amse_kn_max = {}
         total_amse_kn_min = {}
-        for name, algo in algorithms.items():
-            print(f'begin algorithm {name}', flush=True)
+        total_amse_kn_max = {}
+
+        for name, algo in active_algorithms.items():
+            print(f'\n=== Running {name} ===', flush=True)
             selected_servers = algo(
                 candidates=candidates,
                 clients=clients,
@@ -729,154 +817,30 @@ def main():
                 delta_list=delta_list,
                 N=num_scenarios
             )
+
             print(f'--- Algorithm {name} Summary ---')
             print(f"Area size: {area_size} x {area_size}")
-            print(f"Total nodes: {len(nodes)}")
-            print(f"Clients: {len(clients)}, candidates: {n_can if name != 'go' else g_can}")
-            print(f"Alpha={alpha}, Beta={beta}")
-            print(f"Budget: {budget}")
+            print(f"Total nodes: {len(nodes)} | Clients: {len(clients)}")
+            print(f"Budget: {budget} | Selected: {len(selected_servers)} servers")
             print(summarize_selection(selected_servers))
 
-            if alg == 'test':
-                amse_n, amse_kn_avg, amse_kn_min, amse_kn_max, amse_hybrid_n = compute_ota_metrics(
-                    selected_servers,
-                    clients,
-                    target_snr,
-                    delta_list,
-                    sigma2,
-                    gradient_dim,
-                    t_now=None
-                )
-                total_amse_n[name] = amse_n
-                total_amse_kn_avg[name] = amse_kn_avg
-                total_amse_kn_min[name] = amse_kn_min
-                total_amse_kn_max[name] = amse_kn_max
-
-        if alg == 'test' and duration_hours > 0:
-            # Dynamic simulation for greedy placement
-            dynamic_name = 'greedy_dynamic'
-            algo = greedy_server_selection
-            print(f'begin dynamic algorithm {dynamic_name}', flush=True)
-            ts = load.timescale()
-            start_time = ts.from_datetime(datetime(2026, 5, 10, tzinfo=utc))
-            current_time = start_time
-            selected_servers = algo(
-                candidates=candidates,
-                clients=clients,
-                budget=budget,
-                cost=cost,
-                thresh=thresh,
-                alpha=alpha,
-                beta=beta,
-                delta_list=delta_list,
-                N=num_scenarios,
-                t_now=start_time
-            )
-            print(f'--- Dynamic Algorithm {dynamic_name} Initial Summary ---')
-            print(summarize_selection(selected_servers, start_time))
-
-            amse_n_history = defaultdict(list)
-            amse_kn_history = defaultdict(lambda: defaultdict(list))
-            total_duration_seconds = duration_hours * 3600
-            elapsed_seconds = 0
-            outer_elapsed_seconds = 0
-
-            while elapsed_seconds < total_duration_seconds:
-                if outer_elapsed_seconds >= outer_interval_minutes * 60:
-                    selected_servers = algo(
-                        candidates=candidates,
-                        clients=clients,
-                        budget=budget,
-                        cost=cost,
-                        thresh=thresh,
-                        alpha=alpha,
-                        beta=beta,
-                        delta_list=delta_list,
-                        t_now=current_time
-                    )
-                    outer_elapsed_seconds = 0
-                    print(f'Re-placed servers at {elapsed_seconds} seconds')
-
-                ota_results = predictive_ota_control(selected_servers, clients, current_time, target_snr)
-                for n in selected_servers:
-                    snr_dic = {}
-                    for k in clients:
-                        current_snr = k.compute_snr_to(n, current_time)
-                        if k.id in ota_results.get(n.id, {}):
-                            optimized_power = ota_results[n.id][k.id]["power"]
-                            new_snr = optimized_power * (current_snr / k.power)
-                        else:
-                            new_snr = current_snr
-                        snr_dic[k] = new_snr
-                    amse_n_val = compute_amse_n(snr_dic, sigma2, gradient_dim)
-                    amse_n_history[n].append(amse_n_val)
-                    for k in clients:
-                        snr = snr_dic[k]
-                        if snr > 0.0:
-                            cascaded_error = np.prod([1 + d for d in delta_list])
-                            amse_kn_val = (k.noise_variance * k.gradient_dim / snr) * cascaded_error
-                        else:
-                            amse_kn_val = float("inf")
-                        amse_kn_history[n][k].append(amse_kn_val)
-
-                elapsed_seconds += time_step_seconds
-                outer_elapsed_seconds += time_step_seconds
-                current_time = start_time + elapsed_seconds / 86400
-
-            amse_n = {}
-            amse_kn_avg = {}
-            amse_kn_min = {}
-            amse_kn_max = {}
-            for n in selected_servers:
-                if amse_n_history[n]:
-                    amse_n[n] = np.mean(amse_n_history[n])
-
-                client_avgs = [np.mean(amse_kn_history[n][k]) for k in clients if amse_kn_history[n][k]]
-                if client_avgs:
-                    amse_kn_avg[n] = np.mean(client_avgs)
-                    amse_kn_min[n] = min([np.min(amse_kn_history[n][k]) for k in clients if amse_kn_history[n][k]])
-                    amse_kn_max[n] = max([np.max(amse_kn_history[n][k]) for k in clients if amse_kn_history[n][k]])
-
-            total_amse_n[dynamic_name] = amse_n
-            total_amse_kn_avg[dynamic_name] = amse_kn_avg
-            total_amse_kn_min[dynamic_name] = amse_kn_min
-            total_amse_kn_max[dynamic_name] = amse_kn_max
-
-        if alg == 'test':
-            print("\nGenerating and saving plots...")
-            plot_amse_n(total_amse_n, output_dir="plots", log_scale=True)
-            plot_amse_kn_grouped(total_amse_kn_avg, total_amse_kn_min, total_amse_kn_max, output_dir="plots", log_scale=True)
-            plot_comparison_amse_n(total_amse_n)
-            plot_comparison_amse_kn(
-                total_amse_kn_avg,
-                total_amse_kn_min,
-                total_amse_kn_max
+            # Compute OTA-aware metrics
+            amse_n, amse_kn_avg, amse_kn_min, amse_kn_max, _ = compute_ota_metrics(
+                selected_servers, clients, target_snr, delta_list, sigma2, gradient_dim, t_now=None
             )
 
-    else:
-        algo = algorithms[alg]
-        log.info("--- Running single algorithm: %s ---", alg)
-        selected_servers = algo(
-            candidates=candidates,
-            clients=clients,
-            budget=budget,
-            cost=cost,
-            thresh=thresh,
-            alpha=alpha,
-            beta=beta,
-            delta_list=delta_list,
-            N=num_scenarios,
-        )
-        log.info("Algorithm %s selected %d server(s):", alg, len(selected_servers))
-        for s in selected_servers:
-            log.info("  server=%s  type=%s  pos=%s", s.id, s.type.value, s.position.tolist())
-        print(f'--- Algorithm {alg} Summary ---')
-        print(f"Area size: {area_size} x {area_size}")
-        print(f"Total nodes: {len(nodes)}")
-        print(f"Clients: {len(clients)}, candidates: {n_can if alg != 'go' else g_can}")
-        print(f"Alpha={alpha}, Beta={beta}")
-        print(f"Budget: {budget}")
-        print(summarize_selection(selected_servers))
+            total_amse_n[name] = amse_n
+            total_amse_kn_avg[name] = amse_kn_avg
+            total_amse_kn_min[name] = amse_kn_min
+            total_amse_kn_max[name] = amse_kn_max
+
+        # Generate comparison plots
+        print("\nGenerating comparison plots...")
+        plot_amse_n(total_amse_n, output_dir="plots", log_scale=True)
+        plot_amse_kn_grouped(total_amse_kn_avg, total_amse_kn_min, total_amse_kn_max, output_dir="plots", log_scale=True)
+        plot_comparison_amse_n(total_amse_n)
+        plot_comparison_amse_kn(total_amse_kn_avg, total_amse_kn_min, total_amse_kn_max)
+
     log.info("=== SAGIN Simulation END ===")
 
 

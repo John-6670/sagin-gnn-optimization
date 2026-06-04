@@ -12,7 +12,6 @@ def load_dro_results(name):
     dfs = []
     for f in files:
         df = pd.read_csv(f)
-        print(os.path.basename(f))
         tag = os.path.basename(f).replace('dr_sensitivity_', '').replace('_metrics.csv', '').replace('dr_ablation_', '')
         print(f"  tag={tag}")
         df['variant'] = tag
@@ -28,13 +27,14 @@ def plot_sensitivity_dro():
     metrics = ['latency', 'amse', 'energy', 'cvar5']
     hyperparameters = {
         'Budget': ['budget_20', 'budget_30', 'budget_40'],
-        'N (Scenarios)': ['N_32', 'N_64'],
+        'N (Scenarios)': ['N_8', 'N_32', 'N_64'],
         'Epsilon': ['eps_005', 'eps_015'],
-        'Kappa': ['kappa_015', 'kappa_030']
+        'Kappa': ['kappa_015', 'kappa_030', 'kappa_050'],
+        'alpha': ['alpha_01', 'alpha_05', 'alpha_1']
     }
 
     for metric in metrics:
-        fig, axs = plt.subplots(2, 2, figsize=(18, 13))
+        fig, axs = plt.subplots(2, 3, figsize=(18, 13))
         axs = axs.flatten()
         
         for i, (param_name, variants) in enumerate(hyperparameters.items()):
@@ -47,7 +47,8 @@ def plot_sensitivity_dro():
                 grouped = sub.groupby('step')[metric].mean()
                 std = sub.groupby('step')[metric].std().fillna(0)
                 
-                label = variant.replace('_', '=').replace('budget', 'B').replace('N_', 'N=').replace('eps_', 'ε=').replace('kappa_', 'κ=')
+                label = variant.replace('_', '=').replace('budget', 'B').replace('N_', 'N=')\
+                    .replace('eps_', 'ε=').replace('kappa_', 'κ=').replace('alpha_', 'α=')
                 
                 # Special handling for AMSE to make differences more visible
                 if metric == 'amse':

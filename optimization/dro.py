@@ -103,7 +103,7 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
     std_gain = float(np.std(gains))
 
     cvar = _cvar(gains.tolist(), alpha_cvar)
-    penalty = epsilon * std_gain
+    penalty = epsilon * std_gain * 1.5
 
     robust_gain = cvar - penalty
     

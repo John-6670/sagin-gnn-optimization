@@ -1,29 +1,79 @@
 simulation:
-  num_sats: 4
+  num_sats: 9
   num_uavs: 2
   num_ground: 5
-  num_clients: 10
+  num_clients: 125
   area_size: 2000
   gradient_dim: 100
   sigma2: 10
   algorithm: test
   num_scenarios: 8
+  duration_hours: 3
+  time_step_seconds: 600
+  outer_interval_minutes: 60
 
-  # Dynamic Simulation Parameters
-  duration_hours: 6         # Total simulation time
-  time_step_seconds: 60       # Inner loop execution frequency (Fast timescale)
-  outer_interval_minutes: 30  # Outer loop execution frequency (Slow timescale)
+
+nodes:
+  satellite:
+    altitude_km: 550.0
+    inclination_deg: 53.0
+    num_planes: 3
+    sats_per_plane: 6
+    power_w: 500.0
+    coverage_radius_km: 1100.0
+    motion: keplerian
+  
+  uav:
+    altitude_km: 20.0
+    power_w: 10.0
+    station_keeping_km: 2.0
+    deployment: hexagonal
+    coverage_radius_km: 100.0
+    motion: station_keeping
+  
+  ground:
+    urban_macro:
+      count: 6
+      isd_m: 200
+      height_m: 25
+      antenna_gain_dbi: 17
+      power_w: 40.0
+      motion: stationary
+    urban_micro:
+      count: 3
+      isd_m: 50
+      height_m: 10
+      antenna_gain_dbi: 5
+      power_w: 10.0
+      motion: stationary
+    rural:
+      count: 1
+      isd_m: 1732
+      height_m: 35
+      antenna_gain_dbi: 17
+      power_w: 40.0
+      motion: stationary
+  
+  client:
+    stationary_fraction: 0.6
+    pedestrian_fraction: 0.2
+    vehicular_fraction: 0.2
+    urban_fraction: 0.7
+    rural_fraction: 0.3
+    power_w: 0.1
+
 
 algorithm:
   alpha: 0.5
   beta: 0.5
-  budget: 30
+  budget: 20
   delta_list:
-    - 0.1
-    - 0.2
+  - 0.1
+  - 0.05
   snr_threshold: 0.0
-  target_snr: 10.0          # Used by the Inner Loop power control
+  target_snr: 1.0
+
 
 gnn:
   checkpoint: checkpoints/sagin_hgnn.pt
-  kappa: 0.15
+  kappa: 0.3

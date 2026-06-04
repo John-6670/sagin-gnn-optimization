@@ -93,3 +93,4 @@ results/
 *.zip
 
 data/
+precomputed_dataset/

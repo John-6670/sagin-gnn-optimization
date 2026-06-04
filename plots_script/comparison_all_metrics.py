@@ -11,23 +11,7 @@ if not files:
     raise SystemExit('no result csv files found in results/')
 
 metrics = ['latency', 'amse', 'energy', 'cvar5']
-import glob, os
-import glob
-import os
-
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-
-files = glob.glob('results/*_metrics.csv')
-if not files:
-    raise SystemExit('no result csv')
-    raise SystemExit('no result csv files found in results/')
-
-metrics = ['latency', 'amse', 'energy', 'cvar5']
-KNOWN_ALGOS = ['dr_greedy', 'greedy', 'lop', 'go', 'nrs', 'random']
+KNOWN_ALGOS = ['dr_greedy', 'greedy', 'lop', 'go', 'nrs', 'random', 'da']
 DISPLAY_NAME = {
     'dr_greedy': 'proposed_dr_greedy',
     'greedy': 'greedy',
@@ -35,6 +19,7 @@ DISPLAY_NAME = {
     'go': 'go',
     'nrs': 'nrs',
     'random': 'random',
+    'da': 'da',
 }
 
 
@@ -85,17 +70,31 @@ for algo in algorithms:
         n = grouped[m].count().reindex(mu.index).clip(lower=1)
         ci = 1.96 * std / np.sqrt(n)
 
-        if i != 2:
-            axs[i].semilogy(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
-            axs[i].fill_between(mu.index.values, np.clip((mu - ci).values, 1e6, None), 
-                               np.clip((mu + ci).values, 1e6, None), alpha=0.12)
-            axs[i].set_yscale('log')
-            if i == 0:
-                axs[i].set_yscale('log')
-                axs[i].set_ylim(mu.min() * 0.8, mu.max() * 1.2)
-        else:
+        if i == 2:
             axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
             axs[i].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12, linewidth=1)
+            axs[i].set_ylim(0, mu.max())
+        elif i == 1:
+            axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=0.5)
+            axs[i].fill_between(mu.index.values, np.clip((mu - ci).values, 1e-6, None), np.clip((mu + ci).values, 1e-6, None), alpha=0.12, linewidth=1)
+            axs[i].set_yscale('log')
+        elif i == 0:
+            axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
+            axs[i].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12, linewidth=1)
+            
+            # axs[i].set_ylim(mu.min() * 0.8, mu.max() * 10)
+        else:
+            # CVaR (log scale) — avoid forcing huge clipping that breaks autoscale
+            axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
+            axs[i].fill_between(mu.index.values, np.clip((mu - ci).values, 1e-6, None), 
+                               np.clip((mu + ci).values, 1e-6, None), alpha=0.12)
+            axs[i].set_yscale('log')
+            # if i == 0:
+            #     axs[i].set_yscale('log')
+            #     axs[i].set_ylim(-1, mu.max() * 50)
+        # else:
+        #     axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
+        #     axs[i].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12, linewidth=1)
 
 
 for i, t in enumerate(['Latency', 'AMSE', 'Energy', 'CVaR@5%']):

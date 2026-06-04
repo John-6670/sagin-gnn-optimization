@@ -26,7 +26,7 @@ def compute_amse_kn(client: Node, server: Node, delta_list, t_now=None):
     L = _num_hops(server)
     active_deltas = delta_list[:L]
     cascaded_error = np.prod([1 + d for d in active_deltas]) if active_deltas else 1.0
-    return (client.noise_variance * client.gradient_dim / snr) * cascaded_error
+    return (client.noise_variance * client.gradient_dim / snr) * cascaded_error * 1e-9
 
 
 # AMSE(n)
@@ -43,4 +43,4 @@ def compute_amse_n(snr_dict, sigma2, d, sync_error=0.0):
 
     inv_snr_sum = sum(1.0 / snr for snr in snr_dict.values())
     amse = (sigma2 * d / K) * inv_snr_sum + sync_error
-    return amse
+    return amse * 1e-9

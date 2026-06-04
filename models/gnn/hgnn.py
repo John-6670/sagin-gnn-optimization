@@ -19,12 +19,41 @@ class SAGINHeteroGNN(nn.Module):
             for etype in metadata[1]:
                 conv_dict[etype] = GATConv((-1, -1), hidden_dim // heads, heads=heads, add_self_loops=False)
             self.convs.append(HeteroConv(conv_dict, aggr='sum'))
-        self.head = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
+            
+        self.heads = nn.ModuleDict({
+            "satellite": nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            ),
+            "hap": nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            ),
+            "ground": nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            ),
+            # optional safety for missing types
+            "client": nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            )
+        })
 
     def forward(self, data, placement_mask):
         x_dict = {k: F.relu(self.encoders[k](v)) for k, v in data.x_dict.items()}
         for conv in self.convs:
-            x_dict = conv(x_dict, data.edge_index_dict)
+            out_dict = conv(x_dict, data.edge_index_dict)
+
+            for node_type in x_dict:
+                if node_type not in out_dict:
+                    out_dict[node_type] = x_dict[node_type]
+
+            x_dict = out_dict
             x_dict = {k: F.dropout(F.relu(v), p=self.dropout, training=self.training) for k, v in x_dict.items()}
 
         all_embeddings = torch.cat([x_dict[k] for k in x_dict], dim=0)
@@ -32,7 +61,13 @@ class SAGINHeteroGNN(nn.Module):
         pred = {}
         for k, emb in x_dict.items():
             ctx = g_s.repeat(emb.size(0), 1)
-            pred[k] = self.head(torch.cat([emb, ctx], dim=-1)).squeeze(-1)
+            h = torch.cat([emb, ctx], dim=-1)
+
+            if k in self.heads:
+                pred[k] = F.relu(self.heads[k](h).squeeze(-1))
+            else:
+                pred[k] = F.relu(self.heads["ground"](h).squeeze(-1))
+
         return pred
 
 
