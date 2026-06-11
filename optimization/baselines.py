@@ -75,7 +75,7 @@ def random_selection(candidates, clients, budget, cost, thresh, alpha, beta, del
     C = [s for s in candidates if average_snr(s) >= thresh]
     total_cost = 0
     selected = []
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(42)
 
     while C:
         s = rng.choice(C)
@@ -84,10 +84,6 @@ def random_selection(candidates, clients, budget, cost, thresh, alpha, beta, del
             total_cost += cost[s]
         C.remove(s)
 
-    print(
-        "FedSN selected:",
-        [s.id for s in selected]
-    )
     return selected
 
 
@@ -131,7 +127,7 @@ def da_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_l
 
 def fedsn_selection(candidates: List[Node], clients: List[Node], budget: float, cost: dict, **kwargs) -> List[Node]:
     """
-    Improved FedSN-inspired selection: Prioritizes LEO-like satellites with sub-structure feasibility.
+    FedSN-inspired selection: Prioritizes LEO-like satellites with sub-structure feasibility.
     Emulates heterogeneity by preferring nodes with better compute proxies (power) and visibility.
     """
     print(f"\n[FedSN Baseline Selection] Evaluating {len(candidates)} candidates with budget {budget}")

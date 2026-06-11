@@ -432,9 +432,16 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
         client_loaders, test_loader = task.get_data_loaders(len(clients), seed=123)
 
         for alg_name, algo in algorithms.items():
+            if alg_name.lower() == "fedsn":
+                active_clients = [c for c in clients if np.random.rand() > 0.15]  # 15% dropout for orbit
+                snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in active_clients}
+                log.info(f"FedSN pseudo-sync: {len(active_clients)}/{len(clients)} active this round")
+            else:
+                active_clients = clients
+                    
             log.info(f"[{alg_name}] Running server placement...")
             selected = algo(
-                candidates=candidates, clients=clients, budget=budget, cost=cost,
+                candidates=candidates, clients=active_clients, budget=budget, cost=cost,
                 thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list
             )
 
@@ -452,7 +459,7 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
             for r in range(num_rounds):
                 snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in clients}
                 res = FederatedRound(
-                    r, clients, selected, {}, task, model, client_loaders,
+                    r, active_clients, selected, {}, task, model, client_loaders,
                     test_loader, snr_map, delta_list, use_hybrid=True
                 )
                 amse_hist.append(res['amse'])
@@ -526,22 +533,24 @@ def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours,
         lat = compute_e2e_latency(clients, selected, t_now)
         energy = compute_total_energy(clients, selected, ota, transmission_time=time_step_seconds, t_now=t_now)
         
-        # === INSERT FEDSN EMULATION LOGIC ===
         if tag.lower() == "fedsn":
             orig_lat = lat
             orig_energy = energy
+            orig_amse = amse
             
-            # FedSN uses sub-structure pruning (e.g., 50% parameter payload size reduction)
-            # This scales down transmission energy consumption linearly
-            energy = energy * 0.5 
+            # Sub-structure emulation: reduce payload by ~40-60% (paper uses channel partitioning)
+            reduction_factor = 0.55  # adjustable
+            energy = energy * reduction_factor
             
-            # Pseudo-asynchronous window components add a lag/staleness latency penalty 
-            # because the aggregator must wait for out-of-sync partial updates from past orbits
-            lat = lat * 1.35
+            # Pseudo-synchronous: add staleness penalty based on mobility/orbit (higher for sats)
+            staleness_factor = 1.25 if any(s.type == NodeType.SATELLITE for s in selected) else 1.1
+            lat = lat * staleness_factor
             
-            print(f"[FedSN Simulation Step] Timestep: {t_now} | Active Clients: {len(clients)} | Selected Aggregators: {len(selected)}")
-            print(f"  |- Original Network Metrics -> Energy: {orig_energy:.4f} J, Latency: {orig_lat:.4f}s")
-            print(f"  |- FedSN Adjusted Metrics   -> Energy (0.5x Sub-Model): {energy:.4f} J, Latency (1.35x Asynchronous Staleness): {lat:.4f}s")
+            # Slight AMSE benefit from better aggregation (paper claims reduced info loss)
+            amse = amse * 0.92
+            
+            print(f"[FedSN Step] Original: E={orig_energy:.4f}J, Lat={orig_lat:.4f}s, AMSE={orig_amse:.6f}")
+            print(f"         Adjusted: E={energy:.4f}J (x{reduction_factor}), Lat={lat:.4f}s (x{staleness_factor}), AMSE={amse:.6f}")
         
         amse = float(np.mean(amse_vals)) if amse_vals else 0.0
         window_size = 30

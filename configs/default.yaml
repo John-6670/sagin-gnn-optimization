@@ -8,7 +8,7 @@ simulation:
   sigma2: 10
   algorithm: test
   num_scenarios: 8
-  duration_hours: 3
+  duration_hours: 12
   time_step_seconds: 60
   outer_interval_minutes: 30
 
