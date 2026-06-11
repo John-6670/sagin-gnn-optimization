@@ -1,0 +1,3560 @@
+# Project Structure
+
+```
+├── configs
+│   └── default.yaml
+├── fl
+│   ├── convergence.py
+│   ├── device.py
+│   ├── tasks.py
+│   └── trainer.py
+├── graph
+│   ├── __init__.py
+│   └── graph_builder.py
+├── models
+│   └── gnn
+│       ├── __init__.py
+│       ├── dataset.py
+│       ├── hgnn.py
+│       ├── precompute_dataset.py
+│       └── train.py
+├── optimization
+│   ├── __init__.py
+│   ├── baselines.py
+│   ├── dro.py
+│   ├── meta_learner.py
+│   ├── objective.py
+│   └── placement.py
+├── plots_script
+│   ├── comparison_all_metrics.py
+│   └── sensitivity_ablation_dro.py
+├── simulation
+│   ├── environment
+│   │   └── weather.py
+│   ├── evaluation
+│   │   └── metrics.py
+│   ├── network
+│   │   ├── __init__.py
+│   │   ├── channel_model.py
+│   │   ├── channel.py
+│   │   └── models.py
+│   ├── topology
+│   │   ├── __init__.py
+│   │   ├── aircomp.py
+│   │   ├── constellation.py
+│   │   ├── nodes.py
+│   │   └── patching.py
+│   ├── traffic
+│   │   ├── __init__.py
+│   │   └── traffic_generator.py
+│   ├── __init__.py
+│   ├── config_loader.py
+│   └── run_simulation.py
+```
+
+# File Contents
+
+## simulation/config_loader.py
+
+```python
+import yaml
+
+def load_config(path="configs/default.yaml"):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+```
+
+## simulation/environment/weather.py
+
+```python
+from __future__ import annotations
+import math
+import numpy as np
+
+
+class TwoStateWeatherMarkov:
+    def __init__(self, p_clear_to_rain=None, p_rain_to_clear=None, dt_seconds=10.0, seed=None):
+        base_p = 1.0 - math.exp(-dt_seconds / 3600.0)
+        self.p_clear_to_rain = base_p if p_clear_to_rain is None else p_clear_to_rain
+        self.p_rain_to_clear = base_p if p_rain_to_clear is None else p_rain_to_clear
+        self.state = "clear"
+        self.rng = np.random.default_rng(seed)
+    
+    def step(self):
+        u = self.rng.random()
+        if self.state == "clear" and u < self.p_clear_to_rain:
+            self.state = "rainy"
+        elif self.state == "rainy" and u < self.p_rain_to_clear:
+            self.state = "clear"
+        
+        return self.state
+
+    def atmospheric_loss_db(self):
+        return 2.0 if self.state == "clear" else 4.0
+
+```
+
+## simulation/evaluation/metrics.py
+
+```python
+from __future__ import annotations
+import logging
+
+import numpy as np
+
+log = logging.getLogger(__name__)
+
+
+def compute_e2e_latency(clients, servers, t_now=None):
+    vals=[]
+    for c in clients:
+        if not servers:
+            continue
+        # Use median latency to selected servers (not min) to show selection quality variation
+        server_lats = [c.get_latency_to(s, t_now) for s in servers]
+        vals.append(float(np.median(server_lats)))
+    
+    # `get_latency_to` already returns one-way latency in milliseconds.
+    # Return the mean of median per-client latencies.
+    return float(np.mean(vals)) if vals else 0.0
+
+
+def compute_total_energy(clients, selected_servers, ota_params, transmission_time=1.0, t_now=None):
+    e = 0.0
+    max_power_clients = 0
+    power_stats = []  # For debugging
+
+    for c in clients:
+        best_server = None
+        best_snr = -float("inf")
+
+        for s in selected_servers:
+            try:
+                snr = c.compute_snr_to(s, t_now)
+            except:
+                snr = 0.0
+            if snr > best_snr:
+                best_snr = snr
+                best_server = s
+
+        if best_server is not None:
+            cmap = ota_params.get(best_server.id, {})
+            tx_power = float(cmap.get(c.id, {}).get("power", c.power))
+        else:
+            tx_power = c.power
+
+        power_stats.append(tx_power)
+        e += tx_power * transmission_time
+
+        if tx_power >= c.power - 1e-6:
+            max_power_clients += 1
+
+    # Enhanced logging
+    if clients:
+        avg_power_ratio = np.mean([p / c.power for p, c in zip(power_stats, clients)])
+        log.info(f"Energy: {e:.4f} J | Max-power clients: {max_power_clients}/{len(clients)} "
+                    f"| Avg power ratio: {avg_power_ratio:.3f}")
+
+    return e
+
+
+def compute_cvar(loss_history, alpha=0.05):
+    if len(loss_history) == 0:
+        return 0.0
+    
+    arr = np.sort(np.asarray(loss_history, dtype=float))[::-1]
+    k = max(1,int(np.ceil(alpha*len(arr))))
+    return float(np.mean(arr[:k]))
+
+```
+
+## simulation/network/channel.py
+
+```python
+from simulation.topology.nodes import NodeType
+
+
+def link_properties(source, destination):
+    """Return nominal link properties based on node types."""
+    if source.type == NodeType.SATELLITE or destination.type == NodeType.SATELLITE:
+        return {"link_type": "satellite", "bandwidth_mhz": 100, "latency_ms": 30}
+    if source.type == NodeType.UAV or destination.type == NodeType.UAV:
+        return {"link_type": "aerial", "bandwidth_mhz": 50, "latency_ms": 15}
+    return {"link_type": "ground", "bandwidth_mhz": 20, "latency_ms": 5}
+
+```
+
+## simulation/network/channel_model.py
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, Tuple
+
+import numpy as np
+
+
+C_MPS = 299_792_458.0
+EARTH_ROT_RATE_RAD_S = 7.2921159e-5
+
+
+class LinkType(Enum):
+    LEO_GROUND = "leo_ground"
+    HAP_GROUND = "hap_ground"
+    GROUND_GROUND = "ground_ground"
+    LEO_HAP = "leo_hap"
+
+
+@dataclass(frozen=True)
+class LinkParams:
+    k_db: float
+    coherence_time_s: float
+
+
+class SaginChannelModel:
+    """Realistic SAGIN channel model with pathloss, fading, Doppler, and temporal correlation."""
+
+    def __init__(self, carrier_freq_hz: float = 2.4e9, bandwidth_hz: float = 20e6, seed: int | None = None):
+        self.fc = carrier_freq_hz
+        self.bandwidth_hz = bandwidth_hz
+        self.rng = np.random.default_rng(seed)
+        self.link_params: Dict[LinkType, LinkParams] = {
+            LinkType.LEO_GROUND: LinkParams(k_db=10.0, coherence_time_s=25.0),
+            LinkType.HAP_GROUND: LinkParams(k_db=6.0, coherence_time_s=10.0),
+            LinkType.GROUND_GROUND: LinkParams(k_db=-np.inf, coherence_time_s=2.0),
+            LinkType.LEO_HAP: LinkParams(k_db=8.0, coherence_time_s=12.0),
+        }
+        self._weather_state = "clear"
+        self._weather_loss_db_override: float | None = None
+        self._snr_state: Dict[Tuple[int, int], float] = {}
+        self._last_t: Dict[Tuple[int, int], float] = {}
+        
+    def set_weather_loss_db(self, loss_db: float | None):
+        """Set fixed atmospheric attenuation (dB) from external environment model.
+
+        When set to ``None``, the internal weather Markov model is used.
+        """
+        self._weather_loss_db_override = None if loss_db is None else float(loss_db)
+
+    def classify_link(self, node1, node2) -> LinkType:
+        types = {node1.type.value, node2.type.value}
+        if "sat" in types and ("ground" in types or "client" in types):
+            return LinkType.LEO_GROUND
+        if "uav" in types and ("ground" in types or "client" in types):
+            return LinkType.HAP_GROUND
+        if "sat" in types and "uav" in types:
+            return LinkType.LEO_HAP
+        return LinkType.GROUND_GROUND
+
+    def _update_weather_state(self):
+        # two-state Markov: clear/rain
+        if self._weather_state == "clear":
+            if self.rng.random() < 0.08:
+                self._weather_state = "rain"
+        else:
+            if self.rng.random() < 0.25:
+                self._weather_state = "clear"
+
+    def _atmospheric_loss_db(self) -> float:
+        if self._weather_state == "clear":
+            return 2.0
+        return float(self.rng.choice([3.0, 5.0], p=[0.7, 0.3]))
+
+    def _distance_km(self, node1, node2, t_now):
+        p1 = node1.get_position_at(t_now)
+        p2 = node2.get_position_at(t_now)
+        return max(float(np.linalg.norm(p1 - p2)), 1e-6)
+
+    def _pathloss_linear(self, node1, node2, link_type: LinkType, t_now) -> float:
+        d_km = self._distance_km(node1, node2, t_now)
+        d_m = d_km * 1000.0
+        if link_type in (LinkType.LEO_GROUND, LinkType.LEO_HAP):
+            alpha = 1.0
+            rho = (C_MPS / (4.0 * np.pi * self.fc * d_m)) ** alpha
+            if link_type == LinkType.LEO_GROUND:
+                self._update_weather_state()
+                loss_lin = 10 ** (-self._atmospheric_loss_db() / 10.0)
+                rho *= loss_lin
+            return rho
+        # For HAP_GROUND and GROUND_GROUND: use Friis free-space amplitude gain.
+        # Prior code returned 10^(-pl_db/10) which is a *power* gain, but
+        # channel_coefficient squares rho to get |h|^2, so it must be an amplitude.
+        # Hata path loss (designed for <20 km cells) is also inappropriate for SAGIN
+        # distances (tens to hundreds of km); free-space is more suitable.
+        if link_type == LinkType.GROUND_GROUND:
+            # Terrestrial: apply extra 20 dB shadowing penalty relative to free-space
+            shadow_factor = 0.1
+        else:
+            shadow_factor = 1.0
+        rho = shadow_factor * C_MPS / (4.0 * np.pi * self.fc * d_m)
+        return rho
+
+    def _rician_or_rayleigh(self, link_type: LinkType) -> complex:
+        k_db = self.link_params[link_type].k_db
+        if np.isneginf(k_db):
+            return (self.rng.normal() + 1j * self.rng.normal()) / np.sqrt(2.0)
+        k_lin = 10 ** (k_db / 10.0)
+        phi = self.rng.uniform(0, 2 * np.pi)
+        los = np.sqrt(k_lin / (k_lin + 1.0)) * np.exp(1j * phi)
+        nlos = np.sqrt(1.0 / (k_lin + 1.0)) * ((self.rng.normal() + 1j * self.rng.normal()) / np.sqrt(2.0))
+        return los + nlos
+
+    def _doppler_hz(self, node1, node2, t_now) -> float:
+        vel1 = node1.get_velocity_at(t_now)
+        vel2 = node2.get_velocity_at(t_now)
+        rel_v = vel1 - vel2
+        p1 = node1.get_position_at(t_now)
+        p2 = node2.get_position_at(t_now)
+        los = p1 - p2
+        los_hat = los / (np.linalg.norm(los) + 1e-12)
+        radial = float(np.dot(rel_v, los_hat)) * 1000.0
+        omega = np.array([0.0, 0.0, EARTH_ROT_RATE_RAD_S])
+        v_earth = np.cross(omega, (p2 * 1000.0))
+        radial -= float(np.dot(v_earth, los_hat))
+        horiz = np.array([los_hat[0], los_hat[1], 0.0])
+        cos_azim = np.linalg.norm(horiz)
+        cos_elev = np.sqrt(max(0.0, 1.0 - los_hat[2] ** 2))
+        return (self.fc / C_MPS) * radial * cos_elev * max(cos_azim, 1e-6)
+
+    def channel_coefficient(self, node1, node2, t_now) -> complex:
+        link_type = self.classify_link(node1, node2)
+        rho = self._pathloss_linear(node1, node2, link_type, t_now)
+        fading = self._rician_or_rayleigh(link_type)
+        f_d = self._doppler_hz(node1, node2, t_now)
+        t_s = float(getattr(t_now, "tt", 0.0) * 86400.0) if t_now is not None else 0.0
+        phase = np.exp(1j * 2.0 * np.pi * f_d * t_s)
+        return rho * phase * fading
+
+    def snr(self, node1, node2, t_now=None) -> float:
+        h = self.channel_coefficient(node1, node2, t_now)
+        raw_snr = node1.power * (np.abs(h) ** 2) / max(node1.noise_variance, 1e-15)
+
+        key = tuple(sorted((node1.id, node2.id)))
+        if t_now is None:
+            self._snr_state[key] = float(raw_snr)
+            return float(raw_snr)
+        t_s = float(getattr(t_now, "tt", 0.0) * 86400.0)
+        prev = self._snr_state.get(key, float(raw_snr))
+        dt = max(0.0, t_s - self._last_t.get(key, t_s))
+        tc = self.link_params[self.classify_link(node1, node2)].coherence_time_s
+        decay = np.exp(-dt / max(tc, 1e-6))
+        eta = self.rng.normal(0.0, 1.0)
+        correlated = prev * decay + np.sqrt(max(0.0, 1.0 - np.exp(-2.0 * dt / max(tc, 1e-6)))) * eta
+        snr_val = max(1e-12, 0.6 * raw_snr + 0.4 * correlated)
+        self._snr_state[key] = float(snr_val)
+        self._last_t[key] = t_s
+        return float(snr_val)
+
+```
+
+## simulation/network/models.py
+
+```python
+from abc import ABC, abstractmethod
+
+from simulation.network.channel_model import SaginChannelModel
+
+
+class NetworkModel(ABC):
+    @abstractmethod
+    def snr(self, node1, node2, t_now=None):
+        raise NotImplementedError
+
+    @abstractmethod
+    def latency(self, node1, node2, t_now=None):
+        raise NotImplementedError
+
+
+class PathLossModel(NetworkModel):
+    """Backward-compatible wrapper now delegating to the realistic SAGIN model."""
+
+    def __init__(self):
+        self.model = SaginChannelModel()
+
+    def snr(self, node1, node2, t_now=None):
+        return self.model.snr(node1, node2, t_now)
+
+    def latency(self, node1, node2, t_now=None):
+        return node1.get_latency_to(node2, t_now)
+
+```
+
+## simulation/network/__init__.py
+
+```python
+
+```
+
+## simulation/run_simulation.py
+
+```python
+import argparse
+from typing import List, Dict
+import numpy as np
+from matplotlib import pyplot as plt
+import os
+import shutil
+import logging
+from skyfield.api import load
+
+from simulation.config_loader import load_config
+from simulation.topology.nodes import Node, NodeType, generate_nodes
+from simulation.topology.aircomp import compute_amse_n
+from simulation.topology.patching import hybrid_patch
+from simulation.traffic.traffic_generator import generate_spatiotemporal_traffic
+from simulation.environment.weather import TwoStateWeatherMarkov
+from simulation.evaluation.metrics import compute_e2e_latency, compute_total_energy, compute_cvar
+from optimization.placement import predictive_ota_control
+from optimization.baselines import da_selection, lop_selection, go_selection, nrs_selection, random_selection, dr_selection
+from fl.tasks import get_task_registry
+from fl.trainer import FederatedRound
+from fl.convergence import convergence_monitor
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Suppress noisy third-party loggers
+for _noisy in ("PIL", "matplotlib", "urllib3", "filelock"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+log = logging.getLogger("run_simulation")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run a SAGIN placement simulation.")
+    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--budget", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--algorithm", type=str, default=None, help="Override algorithm (e.g., 'all', 'test', 'greedy')")
+    parser.add_argument("--fl", action="store_true", help="Run FL experiments")
+    parser.add_argument("--task", type=str, default=None, help="FL task to run (e.g. 'reddit_nwp', 'cifar10', 'iot_anomaly'). Runs all if omitted.")
+    parser.add_argument("--results-tag", type=str, default="", help="Optional suffix tag for result CSV filenames")
+    parser.add_argument("--sensitivity", action="store_true", help="Run DRO sensitivity analysis and ablation")
+    return parser.parse_args()
+
+
+def summarize_selection(selected_servers: List[Node], t_now=None) -> str:
+    lines = [f"Selected servers ({len(selected_servers)}):"]
+    for server in selected_servers:
+        lines.append(
+            f"- {server.id} ({server.type.value}) at {server.position.tolist()}"
+        )
+    return "\n".join(lines)
+
+
+def build_costs(servers: List[Node]) -> Dict[Node, float]:
+    cost = {}
+    for s in servers:
+        if s.type == NodeType.SATELLITE:
+            cost[s] = 10.0
+        elif s.type == NodeType.UAV:
+            cost[s] = 5.0
+        else:
+            cost[s] = 1.0
+    return cost
+
+
+def plot_amse_n(total_amse_n, output_dir="plots", log_scale=False):
+    """
+    Plots AMSE_n per server.
+    - ylim is 2x the max height.
+    - Scientific notation for very small (< 0.01) and very large (> 1000) values.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for algo_name, algo_data in total_amse_n.items():
+        if not algo_data:
+            continue
+
+        servers = [str(s.id) for s in algo_data.keys()]
+        raw_values = list(algo_data.values())
+        finite_values = [v for v in raw_values if np.isfinite(v) and v > 0]
+        if finite_values:
+            max_val = max(finite_values)
+        else:
+            max_val = 1.0
+
+        plot_values = [v if np.isfinite(v) and v > 0 else max_val * 10 for v in raw_values]
+        if not finite_values:
+            plot_values = [1.0 if not np.isfinite(v) or v <= 0 else v for v in raw_values]
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        bars = ax.bar(servers, plot_values, color='skyblue', edgecolor='black', alpha=0.8)
+
+        if log_scale:
+            ax.set_yscale('log')
+            bottom = min([v for v in plot_values if v > 0]) if any(v > 0 for v in plot_values) else 1e-6
+            ax.set_ylim(bottom=bottom * 0.1, top=max(plot_values) * 2)
+            ax.set_ylabel('AMSE Value (Log Scale)')
+        else:
+            ax.set_ylim(0, max(plot_values) * 1.3)
+            ax.set_ylabel('AMSE Value')
+
+        # Add labels on top of bars
+        for i, bar in enumerate(bars):
+            raw_height = raw_values[i]
+            height = bar.get_height()
+            if not np.isfinite(raw_height) or raw_height <= 0:
+                label = "INF"
+                text_y = height * 1.01 if log_scale else height + (max(plot_values) * 0.03)
+            else:
+                text_y = height * 1.05 if log_scale else height + (max(plot_values) * 0.03)
+                if raw_height < 0.01 or raw_height > 1000:
+                    label = f'{raw_height:.4e}'
+                else:
+                    label = f'{raw_height:.4f}'
+
+            ax.text(bar.get_x() + bar.get_width()/2., text_y,
+                    label, ha='center', va='bottom', 
+                    fontsize=9, fontweight='bold', rotation=0)
+            
+        ax.set_title(f'Algorithm: {algo_name.upper()} - AMSE per Server (n)')
+        ax.set_xlabel('Server ID')
+        ax.grid(axis='y', linestyle='--', alpha=0.4)
+        
+        plt.tight_layout()
+        filepath = os.path.join(output_dir, f"{algo_name}_amse_n.png")
+        plt.savefig(filepath, dpi=300)
+        plt.close(fig)
+        print(f"Saved: {filepath}")
+
+def plot_amse_kn_grouped(total_avg, total_min, total_max, output_dir="plots", log_scale=False):
+    """
+    Plots grouped bars (Min, Avg, Max).
+    Added: Logic to handle extreme differences in values.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for algo_name in total_avg.keys():
+        servers_objs = list(total_avg[algo_name].keys())
+        if not servers_objs: continue
+            
+        servers = [str(s.id) for s in servers_objs]
+        avg_vals = [total_avg[algo_name][s] for s in servers_objs]
+        min_vals = [total_min[algo_name][s] for s in servers_objs]
+        max_vals = [total_max[algo_name][s] for s in servers_objs]
+        
+        x = np.arange(len(servers))
+        width = 0.25 
+        
+        fig, ax = plt.subplots(figsize=(12, 7))
+        
+        if log_scale:
+            ax.set_yscale('log')
+
+        clipped_min = [v if np.isfinite(v) and v > 0 else max([x for x in min_vals if np.isfinite(x) and x > 0], default=1.0) * 10 for v in min_vals]
+        clipped_avg = [v if np.isfinite(v) and v > 0 else max([x for x in avg_vals if np.isfinite(x) and x > 0], default=1.0) * 10 for v in avg_vals]
+        clipped_max = [v if np.isfinite(v) and v > 0 else max([x for x in max_vals if np.isfinite(x) and x > 0], default=1.0) * 10 for v in max_vals]
+
+        b1 = ax.bar(x - width, clipped_min, width, label='Min', color='#a1d99b', edgecolor='black')
+        b2 = ax.bar(x, clipped_avg, width, label='Avg', color='#4292c6', edgecolor='black')
+        b3 = ax.bar(x + width, clipped_max, width, label='Max', color='#ef3b2c', edgecolor='black')
+        
+        def add_labels(bars):
+            # Calculate a small dynamic offset for the text
+            max_h = max([b.get_height() for b in bars])
+            for bar in bars:
+                height = bar.get_height()
+                # Use scientific notation for very small values
+                label = f'{height:.2e}' if height < 0.001 else f'{height:.3f}'
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                        label, ha='center', va='bottom', rotation=90, fontsize=8, color='black')
+                
+        add_labels(b1)
+        add_labels(b2)
+        add_labels(b3)
+        
+        ax.set_title(f'Algorithm: {algo_name.upper()} - AMSE_kn Distribution')
+        ax.set_xticks(x)
+        ax.set_xticklabels(servers)
+        ax.legend(loc='upper right')
+        ax.grid(axis='y', linestyle='--', alpha=0.3)
+        
+        # Increase top margin to make room for vertical labels
+        ax.set_ylim(top=ax.get_ylim()[1] * 1.2)
+        
+        plt.tight_layout()
+        filepath = os.path.join(output_dir, f"{algo_name}_amse_kn_grouped.png")
+        plt.savefig(filepath, dpi=300)
+        plt.close(fig)
+        print(f"Saved: {filepath}")
+
+
+def compute_ota_metrics(selected_servers, clients, target_snr, delta_list, sigma2, gradient_dim, t_now=None):
+    ota_results = predictive_ota_control(selected_servers, clients, t_now, target_snr)
+    amse_n = {}
+    amse_kn_avg = {}
+    amse_kn_min = {}
+    amse_kn_max = {}
+    amse_hybrid_n = {}
+
+    if not selected_servers:
+        return amse_n, amse_kn_avg, amse_kn_min, amse_kn_max, amse_hybrid_n
+
+    cascaded_error = np.prod([1 + d for d in delta_list])
+    for n in selected_servers:
+        snr_dic = {}
+        client_amse_values = []
+
+        for k in clients:
+            current_snr = k.compute_snr_to(n, t_now)
+            optimized = ota_results.get(n.id, {}).get(k.id)
+            if optimized is not None:
+                optimized_power = optimized["power"]
+                new_snr = optimized_power * (current_snr / k.power)
+            else:
+                new_snr = current_snr
+
+            snr_dic[k] = new_snr
+            if new_snr > 0.0:
+                amse_kn_val = (k.noise_variance * k.gradient_dim / new_snr) * cascaded_error
+            else:
+                amse_kn_val = float("inf")
+
+            client_amse_values.append(amse_kn_val)
+
+        amse_n[n] = compute_amse_n(snr_dic, sigma2, gradient_dim)
+        _, hybrid_bound, _ = hybrid_patch(clients, n, {c: {n: snr_dic[c]} for c in clients}, delta_list, num_bits=8)
+        amse_hybrid_n[n] = hybrid_bound
+        if client_amse_values:
+            amse_kn_avg[n] = np.mean(client_amse_values)
+            amse_kn_min[n] = min(client_amse_values)
+            amse_kn_max[n] = max(client_amse_values)
+
+    return amse_n, amse_kn_avg, amse_kn_min, amse_kn_max, amse_hybrid_n
+
+
+def plot_comparison_amse_n(total_amse_n, output_dir="plots"):
+    """
+    Compares all algorithms together for AMSE_n.
+    X-axis represents algorithms
+    Y-axis is the SUM or MEAN of AMSE across selected servers.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    algo_names = list(total_amse_n.keys())
+    # We compare the average AMSE_n across the servers each algo selected
+    avg_values = [np.mean(list(total_amse_n[algo].values())) if total_amse_n[algo] else 0 
+                    for algo in algo_names]
+    
+    max_val = max(avg_values) if avg_values else 1.0
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    bars = ax.bar(algo_names, avg_values, color=plt.cm.Paired(np.linspace(0, 1, len(algo_names))), edgecolor='black')
+    
+    ax.set_ylim(0, max_val * 2)
+    ax.set_ylabel('Mean AMSE_n across Selected Servers')
+    ax.set_title('Algorithm Comparison: Performance Benchmark (AMSE_n)')
+    
+    for bar in bars:
+        height = bar.get_height()
+        label = f'{height:.4e}' if (height < 0.01 or height > 1000) else f'{height:.4f}'
+        ax.text(bar.get_x() + bar.get_width()/2., height + (max_val * 0.05),
+                label, ha='center', va='bottom', fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "comparison_amse_n.png"), dpi=300)
+    plt.close(fig)
+
+
+def plot_comparison_amse_kn(total_avg, total_min, total_max, output_dir="plots"):
+    os.makedirs(output_dir, exist_ok=True)
+    
+    algos = list(total_avg.keys())
+    
+    # Helper to clean lists of inf/nan
+    def get_clean_means(data_dict):
+        means = []
+        for a in algos:
+            vals = list(data_dict[a].values()) if data_dict[a] else [0]
+            # Replace inf with a high penalty or remove them to calculate a real mean
+            clean_vals = [v if np.isfinite(v) else 0 for v in vals] 
+            # If all were inf, we'll handle that below
+            means.append(np.mean(clean_vals))
+        return np.array(means)
+
+    final_avg = get_clean_means(total_avg)
+    final_min = get_clean_means(total_min)
+    final_max = get_clean_means(total_max)
+    
+    # Logic to handle the "Global Max" for ylim when data contains Inf
+    # We find the largest FINITE value to set a reasonable scale
+    all_metrics = np.concatenate([final_avg, final_min, final_max])
+    finite_metrics = all_metrics[np.isfinite(all_metrics)]
+    
+    if len(finite_metrics) > 0 and np.max(finite_metrics) > 0:
+        global_max = np.max(finite_metrics)
+    else:
+        global_max = 1.0 # Fallback if everything is Inf or Zero
+
+    x = np.arange(len(algos))
+    width = 0.25
+    
+    fig, ax = plt.subplots(figsize=(14, 7))
+    b1 = ax.bar(x - width, final_min, width, label='Overall Min', color='#a1d99b', edgecolor='black')
+    b2 = ax.bar(x, final_avg, width, label='Overall Avg', color='#4292c6', edgecolor='black')
+    b3 = ax.bar(x + width, final_max, width, label='Overall Max', color='#ef3b2c', edgecolor='black')
+    
+    # SAFETY CHECK: Set ylim using a finite number
+    ax.set_ylim(0, global_max * 2)
+    
+    def add_labels(bars, original_data_dict):
+        for i, bar in enumerate(bars):
+            algo_name = algos[i]
+            # Check if the original data for this algo was actually infinite
+            # We look at the raw values from the dictionary
+            raw_vals = list(original_data_dict[algo_name].values()) if original_data_dict[algo_name] else []
+            is_inf = any(not np.isfinite(v) for v in raw_vals)
+            
+            height = bar.get_height()
+            
+            if is_inf:
+                label = "INF (Failed)"
+                # Place label at the top of the visible area
+                text_pos = global_max * 1.1 
+            else:
+                label = f'{height:.2e}' if (height < 0.01 or height > 1000) else f'{height:.3f}'
+                text_pos = height + (global_max * 0.05)
+
+            ax.text(bar.get_x() + bar.get_width()/2., text_pos,
+                    label, ha='center', va='bottom', rotation=90, 
+                    fontsize=8, color='red' if is_inf else 'black')
+
+    add_labels(b1, total_min)
+    add_labels(b2, total_avg)
+    add_labels(b3, total_max)
+    
+    ax.set_title('Algorithm Comparison: AMSE_kn (Note: INF values capped for visualization)')
+    ax.set_xticks(x)
+    ax.set_xticklabels(algos)
+    ax.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "comparison_amse_kn_grouped.png"), dpi=300)
+    plt.close(fig)
+
+
+# def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots", task_filter=None):
+#     os.makedirs(output_dir, exist_ok=True)
+#     all_tasks = get_task_registry()
+#     if task_filter:
+#         if task_filter not in all_tasks:
+#             raise ValueError(f"Unknown task '{task_filter}'. Available: {list(all_tasks.keys())}")
+#         tasks = {task_filter: all_tasks[task_filter]}
+#     else:
+#         tasks = all_tasks
+#     log.info("=== FL Experiments START | tasks=%s | algorithms=%s | clients=%d | candidates=%d | budget=%d ===",
+#              list(tasks.keys()), list(algorithms.keys()), len(clients), len(candidates), budget)
+#     for task_name, task in tasks.items():
+#         log.info("--- FL Task: %s | local_epochs=%d | lr=%s | optimizer=%s ---",
+#                  task_name, task.local_epochs, task.lr, task.optimizer)
+#         log.debug("  Loading data loaders for %d clients (seed=123)...", len(clients))
+#         client_loaders, test_loader = task.get_data_loaders(len(clients), seed=123)
+#         log.debug("  Data loaders ready.")
+#         for alg_name, algo in algorithms.items():
+#             log.info("  [%s / %s] Running server selection...", task_name, alg_name)
+#             selected = algo(
+#                 candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+#                 alpha=alpha, beta=beta, delta_list=delta_list
+#             )
+#             if not selected:
+#                 log.warning("  [%s / %s] No servers selected — skipping.", task_name, alg_name)
+#                 continue
+#             log.info("  [%s / %s] Selected %d server(s): %s",
+#                      task_name, alg_name, len(selected),
+#                      [(s.id, s.type.value) for s in selected])
+
+#             model = task.get_model()
+#             log.debug("  [%s / %s] Model built: %s", task_name, alg_name, type(model).__name__)
+#             amse_hist = []
+#             loss_hist = []
+#             acc_hist = []
+#             num_rounds = 12
+#             for r in range(num_rounds):
+#                 log.info("  [%s / %s] Round %2d/%d — computing SNR map...", task_name, alg_name, r+1, num_rounds)
+#                 snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in clients}
+#                 snr_vals = [list(v.values())[0] for v in snr_map.values()]
+#                 log.debug("    SNR stats: min=%.3e  max=%.3e  mean=%.3e",
+#                           min(snr_vals), max(snr_vals), float(np.mean(snr_vals)))
+#                 res = FederatedRound(
+#                     r, clients, selected, {}, task, model, client_loaders,
+#                     test_loader, snr_map, delta_list, use_hybrid=True
+#                 )
+#                 amse_hist.append(res['amse'])
+#                 loss_hist.append(res['loss'])
+#                 acc_hist.append(res['accuracy'])
+#                 log.info("    Round %2d result: active=%d  p_t=%.3f  amse=%.6f  loss=%.6f  acc=%.4f",
+#                          r+1, res['active_clients'], res['p_t'], res['amse'], res['loss'], res['accuracy'])
+
+#             _, logs = convergence_monitor(amse_hist, loss_hist, sigma2=1.0, rho=0.95, gamma=0.5)
+#             log.info("  [%s / %s] Convergence summary — final bound=%.6f  final acc=%.4f  final loss=%.6f",
+#                      task_name, alg_name, logs[-1]['theoretical_bound'], acc_hist[-1], loss_hist[-1])
+#             x = np.arange(1, len(acc_hist)+1)
+#             fig, ax = plt.subplots(figsize=(8,4))
+#             ax.plot(x, acc_hist, label='accuracy')
+#             ax2 = ax.twinx()
+#             ax2.plot(x, [l['theoretical_bound'] for l in logs], color='r', label='bound')
+#             ax.set_title(f"FL {task_name} - {alg_name}")
+#             ax.set_xlabel('round')
+#             ax.set_ylabel('acc')
+#             ax2.set_ylabel('bound')
+#             plt.legend()
+#             fig.legend()
+#             fig.tight_layout()
+#             plot_path = os.path.join(output_dir, f"fl_{task_name}_{alg_name}.png")
+#             fig.savefig(plot_path, dpi=200)
+#             plt.close(fig)
+#             log.info("  [%s / %s] Plot saved: %s", task_name, alg_name, plot_path)
+#     log.info("=== FL Experiments DONE ===")
+
+
+def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots", task_filter=None):
+    os.makedirs(output_dir, exist_ok=True)
+    all_tasks = get_task_registry()
+    if task_filter:
+        tasks = {task_filter: all_tasks[task_filter]}
+    else:
+        tasks = all_tasks
+
+    for task_name, task in tasks.items():
+        log.info(f"--- FL Task: {task_name} ---")
+        client_loaders, test_loader = task.get_data_loaders(len(clients), seed=123)
+
+        for alg_name, algo in algorithms.items():
+            log.info(f"[{alg_name}] Running server placement...")
+            selected = algo(
+                candidates=candidates, clients=clients, budget=budget, cost=cost,
+                thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list
+            )
+
+            if not selected:
+                log.warning(f"[{alg_name}] No servers selected.")
+                continue
+
+            log.info(f"[{alg_name}] Selected {len(selected)} servers")
+
+            # === Run full FL training ===
+            model = task.get_model()
+            amse_hist, loss_hist, acc_hist = [], [], []
+            num_rounds = 12
+
+            for r in range(num_rounds):
+                snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in clients}
+                res = FederatedRound(
+                    r, clients, selected, {}, task, model, client_loaders,
+                    test_loader, snr_map, delta_list, use_hybrid=True
+                )
+                amse_hist.append(res['amse'])
+                loss_hist.append(res['loss'])
+                acc_hist.append(res['accuracy'])
+
+            final_bound, logs = convergence_monitor(amse_hist, loss_hist, sigma2=1.0, rho=0.95, gamma=0.5)
+            
+            fl_feedback = {
+                'final_loss': logs[-1]['loss'],
+                'final_accuracy': acc_hist[-1],
+                'mean_amse': np.mean(amse_hist),
+                'final_bound': final_bound
+            }
+
+            log.info(f"[{alg_name}] FL Result → Acc: {acc_hist[-1]:.4f} | Mean AMSE: {fl_feedback['mean_amse']:.6f} | Bound: {final_bound:.4f}")
+
+            # Plot
+            x = np.arange(1, len(acc_hist)+1)
+            fig, ax = plt.subplots(figsize=(8,4))
+            ax.plot(x, acc_hist, label='Accuracy')
+            ax2 = ax.twinx()
+            ax2.plot(x, [l['theoretical_bound'] for l in logs], color='r', label='Theoretical Bound')
+            ax.set_title(f"FL {task_name} - {alg_name}")
+            ax.set_xlabel('Round')
+            ax.set_ylabel('Accuracy')
+            ax2.set_ylabel('Bound')
+            fig.legend()
+            fig.tight_layout()
+            plot_path = os.path.join(output_dir, f"fl_{task_name}_{alg_name}.png")
+            fig.savefig(plot_path, dpi=200)
+            plt.close(fig)
+
+    log.info("=== FL Experiments DONE ===")
+
+
+def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours, 
+                              time_step_seconds, outer_interval_minutes, target_snr, N,
+                              candidates=None, budget=None, cost=None, thresh=None,
+                              alpha=None, beta=None, delta_list=None):
+    """Helper to run one DRO configuration simulation"""
+    rows = []
+    ts = load.timescale()
+    start = ts.now()
+    weather = TwoStateWeatherMarkov(dt_seconds=time_step_seconds)
+    
+    print(start, [s.id for s in selected])
+
+    total_steps = int((duration_hours*3600)//time_step_seconds)
+    for step in range(total_steps):
+        t_now = start + (step*time_step_seconds)/86400.0
+        traffic = generate_spatiotemporal_traffic(clients, t_now)
+        for c in clients:
+            c.load = float(traffic.get(c.id,0.0))
+        
+        loss_db = weather.atmospheric_loss_db()
+        weather.step()
+        for n in nodes:
+            if hasattr(n,'channel_model'):
+                n.channel_model.set_weather_loss_db(loss_db)
+        
+        avg_traffic = float(np.mean([c.load for c in clients])) if clients else 0.5
+        avg_mobility = float(np.mean([np.linalg.norm(s.get_velocity_at(t_now)) for s in selected])) if selected else 0.0
+        ota = predictive_ota_control(selected, clients, t_now, target_snr, traffic=avg_traffic, mobility=avg_mobility)
+        
+        amse_vals = []
+        for s in selected:
+            snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
+            amse_vals.append(compute_amse_n(snr_dic, sigma2=10, d=100))
+        
+        lat = compute_e2e_latency(clients, selected, t_now)
+        energy = compute_total_energy(clients, selected, ota, transmission_time=time_step_seconds, t_now=t_now)
+        amse = float(np.mean(amse_vals)) if amse_vals else 0.0
+        window_size = 30
+        # CVaR computed on past window only (exclude current step to avoid trending up with AMSE)
+        losses = [r[2] for r in rows[-window_size:]]
+        cvar_step = compute_cvar(losses, alpha=0.05) if losses else amse
+        rows.append((step, lat, amse, energy, cvar_step))
+        
+        # Re-selection every outer interval
+        if (step * time_step_seconds) % (outer_interval_minutes * 60) == 0 and step > 0:
+            old_selected = selected
+            selected = dr_selection(
+                candidates=candidates,
+                clients=clients,
+                budget=budget,
+                cost=cost,
+                thresh=thresh,
+                alpha=alpha,
+                beta=beta,
+                delta_list=delta_list,
+                N=N,
+                t_now=t_now
+            )
+            print(t_now, [s.id for s in selected])
+            if len(old_selected) != len(selected):
+                log.info(f"Server re-selection at step {step}: {len(old_selected)} → {len(selected)} servers")
+    
+    csv_path = f"results/{tag}_metrics.csv"
+    with open(csv_path,'w') as f:
+        f.write('step,latency,amse,energy,cvar5\n')
+        for r in rows:
+            f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]}\n")
+    print(f"   Saved: {csv_path}")
+
+
+def run_full_sweep(
+    algorithms, nodes, clients, candidates, budget, cost, thresh, alpha, beta, delta_list, duration_hours,
+    time_step_seconds, outer_interval_minutes, target_snr, N, results_tag="", sensitivity=False
+):
+    if os.path.exists("results"):
+        log.warning("Results directory already exists. New results will be added but old files may be overwritten if names collide.")
+        shutil.rmtree("results")
+    os.makedirs("results", exist_ok=True)
+    
+    ts = load.timescale()
+    start = ts.now()
+    weather = TwoStateWeatherMarkov(dt_seconds=time_step_seconds)
+    
+    if sensitivity:
+        log.info("Running DRO Sensitivity & Ablation Study...")
+            
+        dr_algo = algorithms['dr_greedy']
+        
+        # Sensitivity Analysis
+        sensitivity_cases = [
+            ("budget_20", 20, N, 0.1, 0.3, alpha), ("budget_30", 30, N, 0.1, 0.3, alpha), ("budget_40", 40, N, 0.1, 0.3, alpha),
+            ("N_8", budget, 8, 0.1, 0.3, alpha), ("N_32", budget, 32, 0.1, 0.3, alpha), ("N_64", budget, 64, 0.1, 0.3, alpha),
+            ("eps_005", budget, N, 0.05, 0.3, alpha), ("eps_015", budget, N, 0.15, 0.3, alpha),
+            ("kappa_015", budget, N, 0.1, 0.15, alpha), ("kappa_030", budget, N, 0.1, 0.30, alpha), ("kappa_060", budget, N, 0.1, 0.60, alpha),
+            ("alpha_01", budget, N, 0.1, 0.3, 0.1), ("alpha_05", budget, N, 0.1, 0.3, 0.5), ("alpha_1", budget, N, 1.0, 0.3, 1.0),
+        ]
+
+        for tag, b, n_scen, eps, kap, alp in sensitivity_cases:
+            print(f"→ DRO Sensitivity: {tag}")
+            selected = dr_algo(
+                candidates=candidates, clients=clients, budget=b, cost=cost,
+                thresh=thresh, alpha=alp, beta=beta, delta_list=delta_list,
+                N=n_scen, t_now=start, epsilon=eps, kappa=kap
+            )
+            _run_single_dro_simulation(
+                selected, clients, nodes, f"dr_sensitivity_{tag}",
+                duration_hours, time_step_seconds, outer_interval_minutes, target_snr, n_scen,
+                candidates=candidates, budget=b, cost=cost, thresh=thresh,
+                alpha=alpha, beta=beta, delta_list=delta_list
+            )
+
+        # Ablation Study
+        ablation_cases = {
+            "full":      lambda: dr_algo(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N=N, epsilon=0.1, kappa=0.3, t_now=start),
+            "no_gnn":    lambda: dr_algo(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N=N, epsilon=0.1, kappa=1.0, t_now=start),
+            "no_swap":   lambda: dr_algo(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N=N, epsilon=0.1, kappa=0.3, t_now=start)[:budget],  # skip local swap
+        }
+
+        for name, sel_func in ablation_cases.items():
+            print(f"→ DRO Ablation: {name}")
+            selected = sel_func()
+            _run_single_dro_simulation(
+                selected, clients, nodes, f"dr_ablation_{name}",
+                duration_hours, time_step_seconds, outer_interval_minutes, target_snr, N,
+                candidates=candidates, budget=budget, cost=cost, thresh=thresh,
+                alpha=alpha, beta=beta, delta_list=delta_list
+            )
+    else:
+        for name, algo in algorithms.items():
+            log.info("Running simulation for algorithm: %s", name)
+            rows = []
+            t_now = start  # use start time for initial selection
+            selected = algo(
+                candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+                alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
+            )
+            total_steps = int((duration_hours*3600)//time_step_seconds)
+            for step in range(total_steps):
+                t_now = start + (step*time_step_seconds)/86400.0
+                traffic = generate_spatiotemporal_traffic(clients, t_now)
+                for c in clients:
+                    c.load = float(traffic.get(c.id,0.0))
+                    
+                loss_db = weather.atmospheric_loss_db()
+                weather.step()
+                for n in nodes:
+                    if hasattr(n,'channel_model'):
+                        n.channel_model.set_weather_loss_db(loss_db)
+                    
+                avg_traffic = float(np.mean([c.load for c in clients])) if clients else 0.5
+                avg_mobility = float(np.mean([np.linalg.norm(s.get_velocity_at(t_now)) for s in selected])) if selected else 0.0
+                ota = predictive_ota_control(selected, clients, t_now, target_snr, traffic=avg_traffic, mobility=avg_mobility)
+    
+                amse_vals = []
+                for s in selected:
+                    snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
+                    amse_vals.append(compute_amse_n(snr_dic, sigma2=10, d=100))
+                    
+                lat = compute_e2e_latency(clients, selected, t_now)
+                energy = compute_total_energy(clients, selected, ota, transmission_time=time_step_seconds, t_now=t_now)
+                if step % 5 == 0 or step == 0:
+                    print(f"Step {step:3d} | Algo: {name if 'name' in locals() else 'DRO'} | "
+                        f"Servers: {len(selected)} | Energy: {energy:.4f}")
+                
+                amse = float(np.mean(amse_vals)) if amse_vals else 0.0
+                # Use rolling window of last 30 steps for CVaR (matches outer_interval_minutes)
+                window_size = 30
+                losses = [r[2] for r in rows[-window_size:]] + [amse]
+                cvar_step = compute_cvar(losses, alpha=0.05)
+                rows.append((step, lat, amse, energy, cvar_step))
+                print('Step {}: latency={:.2f}s, amse={:.6f}, energy={:.2f}J, CVaR5%={:.6f}'.format(step, lat, amse, energy, cvar_step))
+                    
+                # Debug logging for energy anomalies
+                if step > 0 and step % 10 == 0:
+                    avg_power = energy / len(clients) if clients else 0
+                    log.debug(f"Step {step}: energy={energy:.2f}, avg_power_per_client={avg_power:.4f}, num_servers={len(selected)}, num_clients={len(clients)}")
+                    
+                if (step*time_step_seconds)%(outer_interval_minutes*60) == 0 and step > 0:
+                    old_selected = selected
+                    selected = algo(
+                        candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+                        alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
+                    )
+                    if len(old_selected) != len(selected):
+                        log.info(f"Server re-selection at step {step}: {len(old_selected)} → {len(selected)} servers")
+            
+            print('--- Algorithm {} choosed following servers at last time step ---'.format(name))
+            for s in selected:
+                print(f"Server {s.id} ({s.type.value}) at position {s.position.tolist()}")
+            
+            tag = f"_{results_tag}" if results_tag else ""
+            csv_path = f"results/{name}{tag}_metrics.csv"
+            with open(csv_path,'w') as f:
+                f.write('step,latency,amse,energy,cvar5\n')
+                for r in rows:
+                    f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]}\n")
+
+
+def main():
+    args = parse_args()
+    log.info("=== SAGIN Simulation START ===")
+    log.info("Args: config=%s  algorithm=%s  fl=%s  seed=%s  budget=%s",
+             args.config, args.algorithm, args.fl, args.seed, args.budget)
+
+    config = load_config(args.config)
+    log.info("Config loaded from %s", args.config)
+
+    # ====================== Config Parameters ======================
+    num_sats = config["simulation"].get("num_sats", 1)
+    num_uavs = config["simulation"].get("num_uavs", 2)
+    num_ground = config["simulation"].get("num_ground", 4)
+    num_clients = config["simulation"].get("num_clients", 20)
+    area_size = config["simulation"].get("area_size", 2000)
+    gradient_dim = config['simulation'].get('gradient_dim', 100)
+    sigma2 = config['simulation'].get('sigma2', 10)
+
+    alg_param = args.algorithm or config['simulation'].get('algorithm', 'all')
+    duration_hours = config["simulation"].get("duration_hours", 0.0)
+    time_step_seconds = config["simulation"].get("time_step_seconds", 10)
+    outer_interval_minutes = config["simulation"].get("outer_interval_minutes", 30)
+    num_scenarios = config["simulation"].get("num_scenarios", 16)
+
+    alpha = config["algorithm"].get("alpha", 0.5)
+    beta = config["algorithm"].get("beta", 0.5)
+    delta_list = config["algorithm"].get("delta_list", [0.1, 0.2])
+    target_snr = config["algorithm"].get("target_snr", 10.0)
+    budget = args.budget or config["algorithm"].get("budget", 20)
+    thresh = config["algorithm"].get("snr_threshold", 0.0)
+
+    # ====================== Algorithms Dictionary ======================
+    algorithms = {
+        "lop": lop_selection,
+        "go": go_selection,
+        "nrs": nrs_selection,
+        "random": random_selection,
+        "da": da_selection,
+        "dr_greedy": dr_selection,
+    }
+
+    # Decide which algorithms to run
+    if alg_param in ['all', 'test']:
+        active_algorithms = algorithms
+        log.info("Running ALL algorithms (test/all mode)")
+    else:
+        if alg_param not in algorithms:
+            raise ValueError(f"Unknown algorithm '{alg_param}'. Available: {list(algorithms.keys())}")
+        active_algorithms = {alg_param: algorithms[alg_param]}
+        log.info(f"Running single algorithm: {alg_param}")
+
+    log.info("Simulation params: sats=%d uavs=%d ground=%d clients=%d area=%d duration=%.1fh",
+             num_sats, num_uavs, num_ground, num_clients, area_size, duration_hours)
+
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        log.info("Random seed set to %d", args.seed)
+
+    # ====================== Generate Nodes ======================
+    ts = load.timescale()
+    start = ts.now()
+
+    log.info("Generating nodes...")
+    nodes = generate_nodes(
+        num_sats=num_sats,
+        num_uavs=num_uavs,
+        num_ground=num_ground,
+        num_clients=num_clients,
+        area_size=area_size,
+        gradient_dim=gradient_dim,
+        t0=start
+    )
+
+    clients = [n for n in nodes if n.type == NodeType.CLIENT]
+    candidates = [n for n in nodes if n.type != NodeType.CLIENT]
+
+    cost = build_costs(candidates)
+
+    # ====================== FL Experiments ======================
+    if args.fl:
+        log.info("--- FL Experiments Mode ---")
+        run_fl_experiments(
+            active_algorithms, candidates, clients, budget, cost, thresh,
+            alpha, beta, delta_list, output_dir="plots", task_filter=args.task
+        )
+
+    # ====================== Main Simulation Logic ======================
+    if duration_hours > 0:
+        # Dynamic simulation with time evolution
+        log.info(f"Running FULL DYNAMIC SWEEP (duration = {duration_hours}h)")
+        run_full_sweep(
+            algorithms=active_algorithms,
+            nodes=nodes,
+            clients=clients,
+            candidates=candidates,
+            budget=budget,
+            cost=cost,
+            thresh=thresh,
+            alpha=alpha,
+            beta=beta,
+            delta_list=delta_list,
+            duration_hours=duration_hours,
+            time_step_seconds=time_step_seconds,
+            outer_interval_minutes=outer_interval_minutes,
+            target_snr=target_snr,
+            N=num_scenarios,
+            results_tag=args.results_tag,
+            sensitivity=args.sensitivity,
+        )
+    else:
+        # Static test mode (single placement + metrics)
+        log.info("Running STATIC TEST mode (duration=0)")
+        total_amse_n = {}
+        total_amse_kn_avg = {}
+        total_amse_kn_min = {}
+        total_amse_kn_max = {}
+
+        for name, algo in active_algorithms.items():
+            print(f'\n=== Running {name} ===', flush=True)
+            selected_servers = algo(
+                candidates=candidates,
+                clients=clients,
+                budget=budget,
+                cost=cost,
+                thresh=thresh,
+                alpha=alpha,
+                beta=beta,
+                delta_list=delta_list,
+                N=num_scenarios
+            )
+
+            print(f'--- Algorithm {name} Summary ---')
+            print(f"Area size: {area_size} x {area_size}")
+            print(f"Total nodes: {len(nodes)} | Clients: {len(clients)}")
+            print(f"Budget: {budget} | Selected: {len(selected_servers)} servers")
+            print(summarize_selection(selected_servers))
+
+            # Compute OTA-aware metrics
+            amse_n, amse_kn_avg, amse_kn_min, amse_kn_max, _ = compute_ota_metrics(
+                selected_servers, clients, target_snr, delta_list, sigma2, gradient_dim, t_now=None
+            )
+
+            total_amse_n[name] = amse_n
+            total_amse_kn_avg[name] = amse_kn_avg
+            total_amse_kn_min[name] = amse_kn_min
+            total_amse_kn_max[name] = amse_kn_max
+
+        # Generate comparison plots
+        print("\nGenerating comparison plots...")
+        plot_amse_n(total_amse_n, output_dir="plots", log_scale=True)
+        plot_amse_kn_grouped(total_amse_kn_avg, total_amse_kn_min, total_amse_kn_max, output_dir="plots", log_scale=True)
+        plot_comparison_amse_n(total_amse_n)
+        plot_comparison_amse_kn(total_amse_kn_avg, total_amse_kn_min, total_amse_kn_max)
+
+    log.info("=== SAGIN Simulation END ===")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+## simulation/topology/aircomp.py
+
+```python
+import numpy as np
+
+from simulation.topology.nodes import Node
+
+
+def _num_hops(server: Node) -> int:
+    """Number of aggregation hops L(k,n) by server tier."""
+    from simulation.topology.nodes import NodeType
+    if server.type == NodeType.GROUND:
+        return 1
+    if server.type == NodeType.UAV:
+        return 2
+    return 3  # SATELLITE
+
+
+# AMSE(k, n)
+def compute_amse_kn(client: Node, server: Node, delta_list, t_now=None):
+    if t_now is not None:
+        snr = client.compute_snr_to(server, t_now)
+    else:
+        snr = client.compute_snr_to(server)
+
+    if snr <= 0.0:
+        return float("inf")
+
+    L = _num_hops(server)
+    active_deltas = delta_list[:L]
+    cascaded_error = np.prod([1 + d for d in active_deltas]) if active_deltas else 1.0
+    return (client.noise_variance * client.gradient_dim / snr) * cascaded_error * 1e-9
+
+
+# AMSE(n)
+def compute_amse_n(snr_dict, sigma2, d, sync_error=0.0):
+    """
+    snr_dict: dict {k: SNR(k,n)} for all clients k served by n
+    sigma2: noise variance
+    d: gradient dimension
+    sync_error: synchronization error term
+    """
+    K = len(snr_dict)
+    if K == 0:
+        return 0.0
+
+    inv_snr_sum = sum(1.0 / snr for snr in snr_dict.values())
+    amse = (sigma2 * d / K) * inv_snr_sum + sync_error
+    return amse * 1e-9
+
+```
+
+## simulation/topology/constellation.py
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import List, Tuple
+
+import numpy as np
+
+MU_EARTH_KM3_S2 = 398600.4418
+EARTH_RADIUS_KM = 6378.137
+
+
+@dataclass
+class WalkerConstellation:
+    num_planes: int
+    sats_per_plane: int
+    phasing: int = 1
+    inclination: float = 53.0
+    altitude_km: float = 550.0
+
+    def _mean_motion_rev_per_day(self) -> float:
+        a = EARTH_RADIUS_KM + self.altitude_km
+        n_rad_s = np.sqrt(MU_EARTH_KM3_S2 / (a ** 3))
+        return n_rad_s * 86400.0 / (2.0 * np.pi)
+
+    def _format_epoch(self, t0) -> str:
+        dt = t0.utc_datetime() if t0 is not None else datetime.now(timezone.utc)
+        yy = dt.year % 100
+        day = dt.timetuple().tm_yday + (dt.hour + dt.minute / 60.0 + dt.second / 3600.0) / 24.0
+        return f"{yy:02d}{day:012.8f}"
+
+    def generate_tle_list(self, t0=None) -> List[Tuple[str, str]]:
+        epoch = self._format_epoch(t0)
+        n = self._mean_motion_rev_per_day()
+        tles = []
+        satnum = 10000
+        for p in range(self.num_planes):
+            raan = (360.0 / self.num_planes) * p
+            for s in range(self.sats_per_plane):
+                satnum += 1
+                ma = (360.0 / self.sats_per_plane) * s + self.phasing * 360.0 / (self.num_planes * self.sats_per_plane) * p
+                line1 = f"1 {satnum:05d}U 24001A   {epoch}  .00000000  00000-0  00000-0 0  9991"
+                line2 = (
+                    f"2 {satnum:05d} {self.inclination:8.4f} {raan:8.4f} 0001000"
+                    f" 000.0000 {ma % 360.0:8.4f} {n:11.8f}00001"
+                )
+                tles.append((line1, line2))
+        return tles
+
+```
+
+## simulation/topology/nodes.py
+
+```python
+from enum import Enum
+import numpy as np
+from skyfield.api import Topos, load, EarthSatellite
+from typing import List, Optional, Tuple
+
+from simulation.network.channel_model import SaginChannelModel
+from simulation.topology.constellation import WalkerConstellation
+
+TS = load.timescale()
+
+
+class NodeType(Enum):
+    SATELLITE = "sat"
+    UAV       = "uav"
+    GROUND    = "ground"
+    CLIENT    = "client"
+    
+
+class GroundBSType(Enum):
+    URBAN_MACRO = "urban_macro"   # ISD 200 m, height 25 m, gain 17 dBi
+    URBAN_MICRO = "urban_micro"   # ISD  50 m, height 10 m, gain  5 dBi
+    RURAL       = "rural"         # ISD 1732 m, height 35 m, gain 17 dBi
+
+
+class ClientMobilityType(Enum):
+    STATIONARY = "stationary"   # fixed location         – 0 m/s
+    PEDESTRIAN = "pedestrian"   # correlated random walk – 1 m/s
+    VEHICULAR  = "vehicular"    # road-constrained       – 15 m/s
+
+
+# Ground BS physical parameters
+BS_CFG: dict = {
+    GroundBSType.URBAN_MACRO: dict(
+        isd_m=200, height_km=0.025, antenna_gain_dbi=17, power_w=40.0
+    ),
+    GroundBSType.URBAN_MICRO: dict(
+        isd_m=50,  height_km=0.010, antenna_gain_dbi=5,  power_w=10.0
+    ),
+    GroundBSType.RURAL: dict(
+        isd_m=1732, height_km=0.035, antenna_gain_dbi=17, power_w=40.0
+    ),
+}
+
+# Client mobility speeds
+MOB_CFG: dict = {
+    ClientMobilityType.STATIONARY: dict(speed_mps=0.0),
+    ClientMobilityType.PEDESTRIAN: dict(speed_mps=1.0),    # random walk
+    ClientMobilityType.VEHICULAR:  dict(speed_mps=15.0),   # road-aligned
+}
+
+# HAP station-keeping constraint (±2 km from home)
+HAP_BOX_KM: float = 2.0
+
+# Coverage radii (informational; upper layers may use these for link selection)
+SAT_COVERAGE_KM: float  = 1100.0   # 10° min-elevation mask @ 550 km altitude
+HAP_COVERAGE_KM: float  = 100.0    # 20 km altitude
+
+# Thermal noise: kTB at 290 K, 20 MHz ≈ 8×10⁻¹⁴ W → round to 1×10⁻¹³ W
+THERMAL_NOISE_W: float  = 1e-13
+
+
+class Node:
+    channel_model = SaginChannelModel()
+    
+    def __init__(self, node_id, node_type: NodeType, position, power=1.0, noise_variance=1e-9, gradient_dim=100,
+                tle=None, bs_type: Optional[GroundBSType] = None, mobility_type:  Optional[ClientMobilityType]  = None,
+                hap_home: Optional[List[float]] = None,  # [lat°, lon°, alt_km]
+        ):
+        self.id = node_id
+        self.type = node_type
+        self.power = power
+        self.noise_variance = noise_variance
+        self.gradient_dim = gradient_dim
+        self.bs_type = bs_type
+        self.mobility_type  = (
+            mobility_type
+            if mobility_type is not None
+            else (ClientMobilityType.STATIONARY if node_type == NodeType.CLIENT else None)
+        )
+        self.antenna_gain_dbi: float = self._default_antenna_gain()
+        self.load = 0.0
+        
+        # Orbital handling
+        self.tle = tle
+        self.position = np.array(position, dtype=float)
+        self.sat_obj  = (
+            EarthSatellite(tle[0], tle[1], str(node_id), TS) if tle else None
+        )
+
+        # HAP station-keeping state
+        self._hap_home      = np.array(hap_home if hap_home is not None else position, dtype=float)
+        self._hap_offset_km = np.zeros(3)    # XYZ offset from home [km]
+        self._hap_last_t_s: Optional[float] = None
+
+        # Client mobility state
+        self._mob_last_t_s: Optional[float] = None
+        self._velocity_2d = self._init_client_velocity()  # [deg/s lat, deg/s lon]
+
+        self.channels:  dict = {}
+        self.latencies: dict = {}
+        
+    def _default_antenna_gain(self) -> float:
+        if self.bs_type is not None:
+            return BS_CFG[self.bs_type]["antenna_gain_dbi"]
+        if self.type == NodeType.SATELLITE:
+            return 30.0
+        if self.type == NodeType.UAV:
+            return 10.0
+        return 0.0
+
+    def _init_client_velocity(self) -> np.ndarray:
+        if self.type != NodeType.CLIENT:
+            return np.zeros(2)
+
+        mob = self.mobility_type
+
+        if mob == ClientMobilityType.PEDESTRIAN:
+            spd = MOB_CFG[mob]["speed_mps"] / 111_000.0   # m/s → deg/s
+            theta = np.random.uniform(0.0, 2.0 * np.pi)
+            return np.array([np.cos(theta), np.sin(theta)]) * spd
+
+        if mob == ClientMobilityType.VEHICULAR:
+            spd   = MOB_CFG[mob]["speed_mps"] / 111_000.0
+            theta = np.random.choice([0.0, np.pi / 2.0, np.pi, 3.0 * np.pi / 2.0])
+            return np.array([np.cos(theta), np.sin(theta)]) * spd
+
+        return np.zeros(2)
+
+    @staticmethod
+    def _skyfield_t_to_seconds(t_now) -> float:
+        return 0.0 if t_now is None else float(getattr(t_now, "tt", 0.0) * 86400.0)
+
+    def _topos_xyz(self, lat: float, lon: float, alt_km: float, t_now) -> np.ndarray:
+        return (
+            Topos(latitude_degrees=lat, longitude_degrees=lon, elevation_m=alt_km * 1000.0)
+            .at(t_now).position.km
+        )
+
+    def get_position_at(self, t_now=None) -> np.ndarray:
+        if t_now is None:
+            t_now = TS.now()
+
+        # ── Satellites – predictable, high-speed
+        if self.sat_obj is not None:
+            return self.sat_obj.at(t_now).position.km   # ~7.586 km/s at 550 km
+
+        now_s = self._skyfield_t_to_seconds(t_now)
+
+        # ── HAPs – bounded station-keeping, slow random drift
+        if self.type == NodeType.UAV:
+            dt_s = 0.0
+            if self._hap_last_t_s is not None:
+                dt_s = max(0.0, now_s - self._hap_last_t_s)
+            self._hap_last_t_s = now_s
+
+            if dt_s > 0.0:
+                # Small Gaussian step (σ ≈ 0.005 km per simulation minute)
+                sigma_km = 0.005 * (dt_s / 60.0)
+                step     = np.random.normal(0.0, sigma_km, size=3)
+                # Hard clamp: enforce ±HAP_BOX_KM station-keeping box
+                self._hap_offset_km = np.clip(
+                    self._hap_offset_km + step, -HAP_BOX_KM, HAP_BOX_KM
+                )
+
+            home_xyz = self._topos_xyz(*self._hap_home, t_now)
+            return home_xyz + self._hap_offset_km
+
+        # ── Clients – apply mobility model
+        lat, lon, alt_km = self.position
+
+        if self.type == NodeType.CLIENT and self.mobility_type != ClientMobilityType.STATIONARY:
+            dt_s = 0.0
+            if self._mob_last_t_s is not None:
+                dt_s = max(0.0, now_s - self._mob_last_t_s)
+            self._mob_last_t_s = now_s
+
+            if dt_s > 0.0:
+                if self.mobility_type == ClientMobilityType.PEDESTRIAN:
+                    # Correlated random walk: 10 % per-step direction change
+                    if np.random.random() < 0.10:
+                        spd   = MOB_CFG[ClientMobilityType.PEDESTRIAN]["speed_mps"] / 111_000.0
+                        theta = np.random.uniform(0.0, 2.0 * np.pi)
+                        self._velocity_2d = np.array([np.cos(theta), np.sin(theta)]) * spd
+
+                elif self.mobility_type == ClientMobilityType.VEHICULAR:
+                    # Road-constrained: axis-aligned turns with 5 % probability
+                    if np.random.random() < 0.05:
+                        spd   = MOB_CFG[ClientMobilityType.VEHICULAR]["speed_mps"] / 111_000.0
+                        theta = np.random.choice([0.0, np.pi / 2.0, np.pi, 3.0 * np.pi / 2.0])
+                        self._velocity_2d = np.array([np.cos(theta), np.sin(theta)]) * spd
+
+                # Advance lat/lon (correct for longitude convergence at high latitudes)
+                dlat = self._velocity_2d[0] * dt_s
+                dlon = self._velocity_2d[1] * dt_s / max(np.cos(np.radians(lat)), 0.01)
+                self.position[0] += dlat
+                self.position[1] += dlon
+
+        return self._topos_xyz(self.position[0], self.position[1], self.position[2], t_now)
+
+    def get_velocity_at(self, t_now=None) -> np.ndarray:
+        if t_now is None:
+            t_now = TS.now()
+
+        if self.sat_obj is not None:
+            return self.sat_obj.at(t_now).velocity.km_per_s   # 3-vector
+
+        if self.type == NodeType.UAV:
+            return np.zeros(3)   # drift velocity is negligible at HAP scale
+
+        if self.type == NodeType.CLIENT and self.mobility_type != ClientMobilityType.STATIONARY:
+            # Convert deg/s → km/s (111 km per degree)
+            lat = self.position[0]
+            v_lat_km_s = self._velocity_2d[0] * 111.0
+            v_lon_km_s = self._velocity_2d[1] * 111.0 * np.cos(np.radians(lat))
+            return np.array([v_lat_km_s, v_lon_km_s, 0.0])
+
+        return np.zeros(3)
+
+    def get_channel(self, other, t_now=None):
+        return self.channel_model.channel_coefficient(self, other, t_now)
+
+    def compute_snr_to(self, other, t_now=None) -> float:
+        return self.channel_model.snr(self, other, t_now)
+
+    def get_latency_to(self, other, t_now=None) -> float:
+        """One-way propagation latency [ms]."""
+        d_km = np.linalg.norm(
+            self.get_position_at(t_now) - other.get_position_at(t_now)
+        )
+        return d_km * 1_000.0 / 3e8 * 1_000.0
+
+
+def _hexagonal_hap_positions(n: int, radius_km: float = 60.0) -> List[Tuple[float, float]]:
+    """
+    Return n (lat°, lon°) positions evenly distributed on a circle of
+    `radius_km` around the area centre (0°, 0°).
+
+    This approximates a hexagonal grid spacing; with n=4 the positions form
+    a square pattern — a reasonable approximation of the halved 8-HAP hex grid.
+    """
+    km_per_deg = 111.0
+    if n == 1:
+        return [(0.0, 0.0)]
+
+    positions = []
+    for k in range(n):
+        theta = 2.0 * np.pi * k / n
+        lat   = radius_km * np.cos(theta) / km_per_deg
+        lon   = radius_km * np.sin(theta) / km_per_deg
+        positions.append((lat, lon))
+    return positions
+
+
+def generate_nodes(
+    num_sats:     int,
+    num_uavs:     int,
+    num_ground:   int,
+    num_clients:  int,
+    area_size:    float,
+    gradient_dim: int,
+    t0=None,
+    
+) -> List[Node]:
+    nodes: List[Node] = []
+    side_deg = area_size / 111.0
+    half_deg = side_deg / 2.0
+
+    # ── Spatial sampling
+    def rand_ll(urban: bool) -> Tuple[float, float]:
+        if urban:
+            r = 0.35
+            lat = np.random.uniform(-half_deg * r, half_deg * r)
+            lon = np.random.uniform(-half_deg * r, half_deg * r)
+        else:
+            lat = np.random.uniform(-half_deg, half_deg)
+            lon = np.random.uniform(-half_deg, half_deg)
+            # Push outside the urban core (|lat| and |lon| > 35 % of half)
+            if abs(lat) < half_deg * 0.35:
+                lat = np.sign(lat or 1.0) * np.random.uniform(half_deg * 0.35, half_deg)
+        return lat, lon
+
+    # ── 1. Satellites
+    # Walker configuration: num_planes × 6 sats/plane ≈ num_sats
+    #   e.g. 9 sats → 3 planes × 3 = 9
+    tle_list: list = []
+    if num_sats > 0:
+        n_planes       = max(1, num_sats // 3)
+        sats_per_plane = max(1, num_sats // n_planes)
+        walker = WalkerConstellation(
+            num_planes=n_planes, sats_per_plane=sats_per_plane,
+            phasing=1, inclination=53.0, altitude_km=550.0,
+        )
+        tle_list = walker.generate_tle_list(t0)
+
+    for i in range(num_sats):
+        tle      = tle_list[i] if i < len(tle_list) else None
+        lat, lon = rand_ll(urban=False)
+        nodes.append(Node(
+            i, NodeType.SATELLITE, [lat, lon, 550.0],
+            power=500.0, noise_variance=THERMAL_NOISE_W,
+            gradient_dim=gradient_dim, tle=tle,
+        ))
+
+    # ── 2. HAPs (UAVs)
+    # Placed in a hexagonal ring at 60 km spacing; altitude fixed at 20 km.
+    hap_positions = _hexagonal_hap_positions(num_uavs, radius_km=60.0)
+    for j, (lat, lon) in enumerate(hap_positions):
+        idx      = num_sats + j
+        home_pos = [lat, lon, 20.0]
+        nodes.append(Node(
+            idx, NodeType.UAV, home_pos[:],
+            power=10.0, noise_variance=THERMAL_NOISE_W,
+            gradient_dim=gradient_dim, hap_home=home_pos,
+        ))
+
+    # ── 3. Ground BSs
+    n_macro = round(num_ground * 0.60)
+    n_micro = round(num_ground * 0.25)
+    n_rural = num_ground - n_macro - n_micro
+
+    bs_plan: List[Tuple[GroundBSType, int, bool]] = [
+        (GroundBSType.URBAN_MACRO, n_macro, True),
+        (GroundBSType.URBAN_MICRO, n_micro, True),
+        (GroundBSType.RURAL,       n_rural, False),
+    ]
+
+    bs_idx = num_sats + num_uavs
+    for bs_type, count, is_urban in bs_plan:
+        cfg = BS_CFG[bs_type]
+        for _ in range(count):
+            lat, lon = rand_ll(urban=is_urban)
+            nodes.append(Node(
+                bs_idx, NodeType.GROUND,
+                [lat, lon, cfg["height_km"]],
+                power=cfg["power_w"], noise_variance=THERMAL_NOISE_W,
+                gradient_dim=gradient_dim, bs_type=bs_type,
+            ))
+            bs_idx += 1
+
+    # ── 4. Clients
+    n_stat = round(num_clients * 0.60)
+    n_ped  = round(num_clients * 0.20)
+    n_veh  = num_clients - n_stat - n_ped
+
+    def client_specs(mob_type: ClientMobilityType, count: int):
+        """Build list of (mobility_type, is_urban) tuples."""
+        n_urban = round(count * 0.70)
+        return (
+            [(mob_type, True)]  * n_urban +
+            [(mob_type, False)] * (count - n_urban)
+        )
+
+    all_specs = (
+        client_specs(ClientMobilityType.STATIONARY, n_stat) +
+        client_specs(ClientMobilityType.PEDESTRIAN,  n_ped)  +
+        client_specs(ClientMobilityType.VEHICULAR,   n_veh)
+    )
+    np.random.shuffle(all_specs)
+
+    base_idx = num_sats + num_uavs + num_ground
+    for k, (mob_type, is_urban) in enumerate(all_specs):
+        lat, lon = rand_ll(urban=is_urban)
+        power = 0.05 + np.random.uniform(0.0, 0.1)
+        nodes.append(Node(
+            base_idx + k, NodeType.CLIENT, [lat, lon, 0.001],
+            power=power, noise_variance=THERMAL_NOISE_W,
+            gradient_dim=gradient_dim, mobility_type=mob_type,
+        ))
+        nodes[base_idx + k].load = np.random.uniform(0.5, 2.5)
+
+    return nodes
+```
+
+## simulation/topology/patching.py
+
+```python
+from __future__ import annotations
+
+import numpy as np
+
+from simulation.topology.aircomp import compute_amse_n
+
+
+def identify_stragglers(clients, server, snr_map):
+    snrs = np.array([snr_map[c][server] for c in clients], dtype=float)
+    q25, q75 = np.percentile(snrs, [25, 75])
+    iqr = q75 - q25
+    tau = q25 - 1.5 * iqr
+    stragglers = [c for c in clients if snr_map[c][server] < tau]
+    majority = [c for c in clients if c not in stragglers]
+    return stragglers, majority, float(tau)
+
+
+def aircomp_aggregate(clients, server, snr_map, delta_list):
+    stragglers, majority, _ = identify_stragglers(clients, server, snr_map)
+    if not majority:
+        majority = clients
+
+    weighted = []
+    weights = []
+    snr_dict = {}
+    for c in majority:
+        h = c.get_channel(server)
+        p = c.power
+        g = np.random.randn(c.gradient_dim)
+        w = np.abs(h) * np.sqrt(max(p, 1e-12))
+        weighted.append(w * g)
+        weights.append(w)
+        snr_dict[c] = max(snr_map[c][server], 1e-12)
+
+    denom = np.sum(weights) + 1e-12
+    g_majority = np.sum(weighted, axis=0) / denom
+    amse_analog = compute_amse_n(snr_dict, sigma2=np.mean([c.noise_variance for c in majority]), d=majority[0].gradient_dim)
+    return g_majority, amse_analog, stragglers, majority
+
+
+def digital_compress(gradient, num_bits=8):
+    g = np.asarray(gradient)
+    gmin, gmax = g.min(), g.max()
+    if np.isclose(gmax, gmin):
+        return g.copy(), 0.0
+    delta = (gmax - gmin) / (2**num_bits - 1)
+    q = np.round(g / delta) * delta
+    eps_q = (delta**2) / 12.0
+    return q, float(eps_q)
+
+
+def hybrid_patch(clients, server, snr_map, delta_list, num_bits=8):
+    low_snr_clients = detect_low_snr_clients(
+        clients,
+        server,
+        snr_map,
+    )
+    
+    analog_clients = [c for c in clients if c not in low_snr_clients]
+    g_majority, amse_analog, stragglers, majority = aircomp_aggregate(analog_clients, server, snr_map, delta_list)
+    K = len(analog_clients)
+    if K == 0:
+        return np.array([]), 0.0, {"stragglers": [], "majority": []}
+
+    if stragglers:
+        compressed = []
+        eps = []
+        for c in stragglers:
+            gk = np.random.randn(c.gradient_dim)
+            q, eq = digital_compress(gk, num_bits=num_bits)
+            compressed.append(q)
+            eps.append(eq)
+        g_digital = np.mean(compressed, axis=0)
+        eps_q = float(np.mean(eps))
+    else:
+        g_digital = np.zeros_like(g_majority)
+        eps_q = 0.0
+
+    w_a = len(majority) / K
+    w_d = len(stragglers) / K
+    g_hybrid = w_a * g_majority + w_d * g_digital
+    amse_bound = (w_a**2) * amse_analog + (w_d**2) * eps_q
+    return g_hybrid, float(amse_bound), {"stragglers": stragglers, "majority": majority, "w_a": w_a, "w_d": w_d}
+
+
+def detect_low_snr_clients(clients, server, snr_map, threshold=3.0):
+    low_clients = []
+
+    for c in clients:
+        snr = snr_map[c][server]
+
+        if snr < threshold:
+            low_clients.append(c)
+
+    return low_clients
+
+```
+
+## simulation/topology/__init__.py
+
+```python
+
+```
+
+## simulation/traffic/traffic_generator.py
+
+```python
+import numpy as np
+
+TABLE_III = {
+    0: {"urban": 0.5, "rural": 0.2, "hotspot": 1.2},
+    1: {"urban": 0.8, "rural": 0.3, "hotspot": 1.4},
+    2: {"urban": 1.2, "rural": 0.5, "hotspot": 1.8},
+    3: {"urban": 1.0, "rural": 0.4, "hotspot": 1.5},
+    4: {"urban": 0.6, "rural": 0.25, "hotspot": 1.25},
+}
+
+
+def generate_traffic(num_clients, mean=1.0):
+    return np.random.exponential(mean, size=num_clients)
+
+
+def _period_from_hour(hour):
+    if 0 <= hour < 5: return 0
+    if 5 <= hour < 9: return 1
+    if 9 <= hour < 17: return 2
+    if 17 <= hour < 22: return 3
+    return 4
+
+
+def generate_spatiotemporal_traffic(clients, t_now, area_size_km=2000.0, hotspot_xy_km=(0.0, 0.0)):
+    hour = t_now.utc_datetime().hour if t_now is not None else 12
+    row = TABLE_III[_period_from_hour(hour)]
+    urban_radius = 0.30 * (area_size_km / 2.0)
+    rates = {}
+    for c in clients:
+        x, y = float(c.position[0]), float(c.position[1])
+        r = np.sqrt(x*x + y*y)
+        base = row["urban"] if r <= urban_radius else row["rural"]
+        d_hotspot_m = np.sqrt((x-hotspot_xy_km[0])**2 + (y-hotspot_xy_km[1])**2) * 1000.0
+        mult = row["hotspot"] if d_hotspot_m <= 500.0 else 1.0
+        rates[c.id] = float(base * mult)
+    return rates
+```
+
+## simulation/traffic/__init__.py
+
+```python
+
+```
+
+## simulation/__init__.py
+
+```python
+
+```
+
+## optimization/baselines.py
+
+```python
+import numpy as np
+
+from optimization.objective import compute_amse_kn_from_snr
+from optimization.placement import greedy_server_selection, dr_greedy_server_selection
+from simulation.topology.nodes import NodeType
+
+
+def lop_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N, t_now=None):
+    selected = []
+    total_cost = 0
+    C = candidates.copy()
+    
+    while C:
+        best = None
+        best_score = float('inf')
+        
+        for s in C:
+            total_latency = sum(
+                min([c.get_latency_to(ss) for ss in selected + [s]])
+                for c in clients
+            )
+            if total_cost + cost[s] <= budget and total_latency < best_score:
+                best = s
+                best_score = total_latency
+        
+        if best is None:
+            break
+        
+        C.remove(best)
+        total_cost += cost[best]
+        selected.append(best)
+        
+    return selected
+
+
+def go_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N, t_now=None):
+    ground_candidates = [n for n in candidates if n.type == NodeType.GROUND]
+
+    return greedy_server_selection(
+        candidates=ground_candidates,
+        clients=clients,
+        budget=budget,
+        cost=cost,
+        thresh=thresh,
+        alpha=alpha,
+        beta=beta,
+        delta_list=delta_list,
+        N=N
+    )
+
+
+def nrs_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N, t_now=None):
+    # same greedy but NO threshold
+    return greedy_server_selection(
+        candidates=candidates,
+        clients=clients,
+        budget=budget,
+        cost=cost,
+        thresh=float("-inf"),  # disables threshold
+        alpha=alpha,
+        beta=beta,
+        delta_list=delta_list,
+        N=N
+    )
+
+
+def random_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N, t_now=None):
+    if not clients:
+        return []
+
+    def average_snr(server):
+        return np.mean([server.compute_snr_to(c, t_now) for c in clients])
+
+    C = [s for s in candidates if average_snr(s) >= thresh]
+    total_cost = 0
+    selected = []
+    rng = np.random.default_rng(42)
+
+    while C:
+        s = rng.choice(C)
+        if total_cost + cost[s] <= budget:
+            selected.append(s)
+            total_cost += cost[s]
+        C.remove(s)
+
+    return selected
+
+
+def da_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N, t_now=None):
+    selected = []
+    total_cost = 0
+    C = candidates.copy()
+
+    while C:
+        best_candidate = None
+        best_score = float('inf')
+
+        for s in C:
+            if total_cost + cost[s] > budget:
+                continue
+
+            total_loss = 0.0
+            candidate_servers = selected + [s]
+            for c in clients:
+                best_cost = float('inf')
+                for s2 in candidate_servers:
+                    latency = c.get_latency_to(s2, t_now)
+                    snr = c.compute_snr_to(s2, t_now)
+                    amse = compute_amse_kn_from_snr(c, snr, delta_list, server=s2)
+                    best_cost = min(best_cost, latency + beta * amse)
+                total_loss += best_cost
+
+            if total_loss < best_score:
+                best_score = total_loss
+                best_candidate = s
+
+        if best_candidate is None:
+            break
+
+        selected.append(best_candidate)
+        total_cost += cost[best_candidate]
+        C.remove(best_candidate)
+
+    return selected
+
+
+def dr_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N, t_now=None, **kwargs):
+    return dr_greedy_server_selection(
+        candidates=candidates,
+        clients=clients,
+        budget=budget,
+        cost=cost,
+        thresh=thresh,
+        alpha=alpha,
+        beta=beta,
+        delta_list=delta_list,
+        t_now=t_now,
+        N=N,
+        **kwargs,
+    )
+
+```
+
+## optimization/dro.py
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Sequence
+
+import numpy as np
+
+from optimization.objective import compute_utility
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ScenarioBundle:
+    scenarios: List[Dict]
+    clients: List
+    candidates: List
+    delta_list: List[float]
+    alpha: float
+    beta: float
+    latency_map: Dict = None
+
+
+def sample_snr_scenarios(clients, candidates, t_now, N: int, coherence_time: float, sigma_snr: float, dt_seconds: float = 10.0):
+    """Sample N SNR scenario maps with OU temporal perturbation per link."""
+    rho = np.exp(-dt_seconds / max(coherence_time, 1e-6))
+    scenarios = []
+    logger.info("Sampling %d SNR scenarios (clients=%d, candidates=%d)", N, len(clients), len(candidates))
+    for _ in range(N):
+        snr_map = {}
+        for c in clients:
+            snr_map[c] = {}
+            for s in candidates:
+                base = max(c.compute_snr_to(s, t_now), 1e-12)
+                noise = np.random.normal(0.0, sigma_snr)
+                log_snr = np.log(base)
+                perturbed_log = rho * log_snr + np.sqrt(max(0.0, 1.0 - rho * rho)) * noise
+                snr_map[c][s] = float(np.exp(perturbed_log))
+        scenarios.append(snr_map)
+        # periodic progress log to show long-running sampling
+        if N >= 10 and len(scenarios) % max(1, N // 10) == 0:
+            logger.info("  sampled %d/%d SNR scenarios...", len(scenarios), N)
+    return scenarios
+
+
+def _cvar(values: Sequence[float], alpha_cvar: float) -> float:
+    if not values:
+        return 0.0
+    arr = np.asarray(values, dtype=float)
+    # remove NaN/inf to avoid invalid arithmetic
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 0.0
+    q = np.quantile(arr, alpha_cvar)
+    tail = arr[arr <= q]
+    return float(np.mean(tail)) if len(tail) > 0 else float(q)
+
+
+def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_cvar: float):
+    scenario_gains = []
+    for idx, snr_map in enumerate(scenarios.scenarios, start=1):
+        curr = compute_utility(
+            S,
+            scenarios.clients,
+            scenarios.alpha,
+            scenarios.beta,
+            scenarios.delta_list,
+            snr_map=snr_map,
+            latency_map=getattr(scenarios, 'latency_map', None),
+        )
+
+        new = compute_utility(
+            S + [v],
+            scenarios.clients,
+            scenarios.alpha,
+            scenarios.beta,
+            scenarios.delta_list,
+            snr_map=snr_map,
+            latency_map=getattr(scenarios, 'latency_map', None),
+        )
+
+        gain = curr - new
+        scenario_gains.append(gain)
+        if len(scenarios.scenarios) >= 10 and idx % max(1, len(scenarios.scenarios)//10) == 0:
+            logger.debug("  robust_marginal_gain progress: computed gains for %d/%d scenarios", idx, len(scenarios.scenarios))
+
+    gains = np.asarray(scenario_gains, dtype=float)
+    # sanitize infinities and NaNs: treat inf as large finite, NaN as zero gain
+    if gains.size == 0:
+        return 0.0, {'mean_gain': 0.0, 'cvar': 0.0}
+    gains = gains.copy()
+    # Replace NaN with 0 (no gain) and clip infinities
+    nan_mask = np.isnan(gains)
+    gains[nan_mask] = 0.0
+    pos_inf = np.isposinf(gains)
+    neg_inf = np.isneginf(gains)
+    LARGE = 1e12
+    gains[pos_inf] = LARGE
+    gains[neg_inf] = -LARGE
+
+    mean_gain = float(np.mean(gains))
+    std_gain = float(np.std(gains))
+
+    cvar = _cvar(gains.tolist(), alpha_cvar)
+    penalty = epsilon * std_gain * 1.5
+
+    robust_gain = cvar - penalty
+    
+    if robust_gain < 1e-6 and mean_gain > 0:
+        robust_gain = mean_gain * 0.7
+
+    return float(robust_gain), {
+        'mean_gain': mean_gain,
+        'cvar': float(cvar),
+    }
+
+
+def local_one_swap(S, candidates, budget, cost, scenarios: ScenarioBundle, epsilon, alpha_cvar,
+                    max_iter: int = 20, tol: float = 1e-6):
+    S = list(S)
+    iter_no = 0
+    seen_configs = set()
+    while iter_no < max_iter:
+        iter_no += 1
+        logger.info("local_one_swap iteration %d: current set size=%d", iter_no, len(S))
+
+        key = tuple(sorted(getattr(x, 'id', id(x)) for x in S))
+        if key in seen_configs:
+            logger.info("local_one_swap: repeated configuration detected, stopping to avoid cycle")
+            break
+        seen_configs.add(key)
+
+        best_swap = None
+        best_improvement = tol
+
+        for s in list(S):
+            base_set = [x for x in S if x != s]
+            base_cost = sum(cost[x] for x in base_set)
+            old_score = robust_marginal_gain(base_set, s, scenarios, epsilon, alpha_cvar)[0]
+            for v in candidates:
+                if v in S:
+                    continue
+                if base_cost + cost[v] > budget:
+                    continue
+                new_score = robust_marginal_gain(base_set, v, scenarios, epsilon, alpha_cvar)[0]
+                improvement = new_score - old_score
+                if improvement > best_improvement:
+                    best_swap = (s, v, old_score, new_score, improvement)
+
+        if best_swap is None:
+            logger.info("local_one_swap: no improving swap found, stopping at iteration %d", iter_no)
+            break
+
+        s, v, old_score, new_score, improvement = best_swap
+        logger.info(
+            "  best swap: replace %s with %s (old_score=%.6f new_score=%.6f delta=%.6f)",
+            getattr(s, 'id', s), getattr(v, 'id', v), old_score, new_score, improvement,
+        )
+        S = [x for x in S if x != s] + [v]
+
+    if iter_no >= max_iter:
+        logger.info("local_one_swap: reached max_iter=%d, stopping", max_iter)
+
+    return S
+
+
+def amse_cvar_from_scenarios(S, scenarios: ScenarioBundle, alpha_cvar: float) -> float:
+    """CVaR of AMSE over scenario bundle for current placement S."""
+    from simulation.topology.aircomp import compute_amse_n
+    amse_vals = []
+    for snr_map in scenarios.scenarios:
+        per_server = []
+        for v in S:
+            snr_dict = {c: snr_map[c].get(v, 1e-12) for c in scenarios.clients}
+            sigma2 = float(np.mean([c.noise_variance for c in scenarios.clients]))
+            d = scenarios.clients[0].gradient_dim if scenarios.clients else 100
+            per_server.append(compute_amse_n(snr_dict, sigma2, d))
+        amse_vals.append(float(np.mean(per_server)) if per_server else 0.0)
+    return _cvar(amse_vals, alpha_cvar)
+
+
+def bisect_lambda_for_amse_target(S, scenarios: ScenarioBundle,
+                                    alpha_cvar: float, tau_amse: float) -> float:
+    """
+    Bisection on dual variable λ to enforce CVaR(AMSE) ≤ τ_AMSE. 
+    Returns λ*.
+    """
+    if not S or amse_cvar_from_scenarios(S, scenarios, alpha_cvar) <= tau_amse:
+        return 0.0
+    lo, hi = 0.0, 1e3
+    logger.info("bisect_lambda_for_amse_target: tau_amse=%.6f starting bisection", tau_amse)
+    for i in range(40):
+        mid = (lo + hi) / 2.0
+        penalised = amse_cvar_from_scenarios(S, scenarios, alpha_cvar) / (1.0 + mid)
+        logger.debug("  bisection iter %d: mid=%.6f penalised=%.6f", i+1, mid, penalised)
+        if penalised > tau_amse:
+            lo = mid
+        else:
+            hi = mid
+    res = (lo + hi) / 2.0
+    logger.info("bisect_lambda_for_amse_target: finished lambda=%.6f", res)
+    return res
+
+```
+
+## optimization/meta_learner.py
+
+```python
+from __future__ import annotations
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+
+class MAMLInnerOptimizer:
+    def __init__(self, param_dim: int = 2, inner_lr: float = 1e-2, meta_lr: float = 5e-3, inner_steps: int = 5):
+        self.phi = torch.nn.Parameter(torch.zeros(param_dim, dtype=torch.float32))
+        self.inner_lr = inner_lr
+        self.meta_opt = torch.optim.Adam([self.phi], lr=meta_lr)
+        self.inner_steps = inner_steps
+        self.sync_mlp = nn.Sequential(nn.Linear(3, 16), nn.ReLU(), nn.Linear(16, 1))
+        self.sync_opt = torch.optim.Adam(self.sync_mlp.parameters(), lr=meta_lr)
+
+    def _loss(self, snr_tensor, params):
+        power_scale = torch.sigmoid(params[0])
+        phase_bias = params[1]
+        effective = snr_tensor * power_scale * torch.cos(phase_bias).abs().clamp(min=1e-3)
+        return torch.mean(1.0 / effective.clamp(min=1e-6))
+
+    def adapt(self, snr_values):
+        snr_t = torch.tensor(np.asarray(snr_values, dtype=np.float32) + 1e-6)
+        params = self.phi.clone().requires_grad_(True)
+        for _ in range(self.inner_steps):
+            loss = self._loss(snr_t, params)
+            grad = torch.autograd.grad(loss, params, create_graph=True)[0]
+            params = params - self.inner_lr * grad
+        return params, self._loss(snr_t, params)
+
+    def maml_update(self, snr_values, traffic, mobility):
+        self.meta_opt.zero_grad()
+        self.sync_opt.zero_grad()
+        adapted, meta_loss = self.adapt(snr_values)
+        snr_mean = float(np.mean(snr_values)) if len(snr_values) else 0.0
+        sync_adj = self.sync_mlp(torch.tensor([traffic, mobility, snr_mean], dtype=torch.float32))
+        total_loss = meta_loss + 0.01 * sync_adj.pow(2).mean()
+        total_loss.backward()
+        self.meta_opt.step()
+        self.sync_opt.step()
+        return adapted.detach(), float(sync_adj.item()), float(total_loss.item())
+
+```
+
+## optimization/objective.py
+
+```python
+import logging
+import numpy as np
+
+from simulation.topology.nodes import NodeType
+
+logger = logging.getLogger(__name__)
+
+
+def weighted_compound_loss(latency, amse, alpha, beta):
+    """Compute a weighted compound objective for placement evaluation."""
+    return alpha * latency + beta * amse
+
+
+def _normalize_latency_and_amse(latency, amse, latency_scale, amse_scale):
+    latency_norm = latency / latency_scale if latency_scale > 0 else latency
+    amse_norm = amse / amse_scale if amse_scale > 0 else amse
+    return latency_norm, amse_norm
+
+
+def _num_hops_from_server(server) -> int:
+    """Hops L(k,n) by server node type."""
+    from simulation.topology.nodes import NodeType
+    if server.type == NodeType.GROUND:
+        return 1
+    if server.type == NodeType.UAV:
+        return 2
+    return 3  # SATELLITE
+
+
+def compute_amse_kn_from_snr(client, snr, delta_list, server=None):
+    """AMSE surrogate — uses tier-specific cascaded error L(k,n)."""
+    if snr <= 1e-12:
+        return float("inf")
+
+    if server is not None:
+        L = _num_hops_from_server(server)
+        active_deltas = delta_list[:L]
+    else:
+        active_deltas = delta_list
+    cascaded_error = np.prod([1 + d for d in active_deltas]) if active_deltas else 1.0
+    return (client.noise_variance * client.gradient_dim / snr) * cascaded_error * 1e-9
+
+
+def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, latency_map=None, fl_result=None, use_ota=True):
+    from simulation.topology.aircomp import compute_amse_n
+    
+    if not servers:
+        return float(len(clients) * 2000.0)
+    
+    total_utility = 0.0
+    total_amse = 0.0
+    
+    # Precompute per-server aggregated AMSE
+    server_amse = {}
+    server_amse_transformed = {}
+    
+    for server in servers:
+        snr_dict = {}
+        for client in clients:
+            if snr_map is not None:
+                snr = snr_map[client].get(server, 1e-12)
+            else:
+                snr = client.compute_snr_to(server)
+            snr_dict[client] = max(snr, 1e-12)
+        
+        # Compute aggregated AMSE for this server across all clients
+        sigma2 = 10.0  # default noise variance
+        gradient_dim = clients[0].gradient_dim if clients else 100
+        server_amse[server] = compute_amse_n(snr_dict, sigma2, gradient_dim)
+        # transform AMSE to a log-scale score so multiplicative gaps become additive
+        eps = 1e-18
+        server_amse_transformed[server] = -np.log10(server_amse[server] + eps)
+    
+    # Collect latencies per client-server pair for normalization
+    all_latencies = []
+    # use transformed AMSE values for normalization and scoring
+    all_server_amses = list(server_amse_transformed.values())
+    
+    for client in clients:
+        best_cost = float('inf')
+        best_amse = float('inf')
+        best_server = None
+
+        for server in servers:
+            if latency_map is not None:
+                latency = float(latency_map.get(client, {}).get(server, client.get_latency_to(server)))
+            else:
+                latency = client.get_latency_to(server)
+
+            all_latencies.append(latency)
+            raw_amse = server_amse[server]
+            score_amse = server_amse_transformed[server]
+
+            load_factor = 1.0 + 0.3 * getattr(client, 'load', 0.0)
+            # quick heuristic selection before normalization uses transformed score
+            compound = (latency, score_amse, load_factor)
+
+            if compound[0] + compound[1] * 0.1 < best_cost:
+                best_cost = compound[0] + compound[1] * 0.1
+                best_amse = raw_amse
+                best_server = server
+
+        total_amse += best_amse
+    
+    # Normalize and compute final utility
+    latency_scale = max(max(all_latencies) if all_latencies else 1.0, 1e-6)
+    amse_scale = max(max(all_server_amses) if all_server_amses else 1.0, 1e-12)
+    
+    
+    total_utility = 0.0
+    for client in clients:
+        best_cost = float('inf')
+        for server in servers:
+            if latency_map is not None:
+                latency = float(latency_map.get(client, {}).get(server, client.get_latency_to(server)))
+            else:
+                latency = client.get_latency_to(server)
+
+            raw_amse = server_amse[server]
+            score_amse = server_amse_transformed[server]
+            normalized_latency = latency / latency_scale
+            normalized_amse = score_amse / amse_scale
+
+            load_factor = 1.0 + 0.3 * getattr(client, 'load', 0.0)
+            compound = weighted_compound_loss(normalized_latency, normalized_amse, alpha, beta) * load_factor
+
+            best_cost = min(best_cost, compound)
+
+        total_utility += best_cost
+    
+    gamma = 0.6
+    fl_penalty = gamma * total_amse * 0.25
+    
+    avg_amse = total_amse / len(clients) if clients else 0.0
+    if fl_result is not None:
+        final_loss = fl_result.get('final_loss', 0.0)
+        mean_amse = fl_result.get('mean_amse', avg_amse)
+        fl_penalty += 0.8 * final_loss + 0.5 * mean_amse
+
+    final_utility = total_utility + fl_penalty
+    
+    return final_utility
+
+```
+
+## optimization/placement.py
+
+```python
+import logging
+
+import numpy as np
+from typing import List, Dict
+
+from simulation.topology.nodes import Node, NodeType
+from optimization.objective import compute_utility
+from optimization.dro import ScenarioBundle, sample_snr_scenarios, robust_marginal_gain, local_one_swap
+from optimization.meta_learner import MAMLInnerOptimizer
+from models.gnn.train import predict_candidate_scores
+
+log = logging.getLogger(__name__)
+
+
+def _get_tier_budgets(budget, num_sats=36, num_uavs=8, num_ground=20):
+    return {
+        NodeType.SATELLITE: 1,
+        NodeType.UAV: max(2, int(budget * 0.4)),
+        NodeType.GROUND: max(5, int(budget * 0.3)),
+    }
+
+
+class KalmanTimingFilter:
+    def __init__(self, dt=1.0, q_var=1e-10, r_var=1e-9):
+        self.dt = dt
+        self.x = np.zeros((2, 1))
+        self.P = np.eye(2)
+        self.F = np.array([[1.0, dt], [0.0, 1.0]])
+        self.H = np.array([[1.0, 0.0]])
+        self.Q = q_var * np.array([[dt**4 / 4, dt**3 / 2], [dt**3 / 2, dt**2]])
+        self.R = np.array([[r_var]])
+
+    def predict(self):
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return self.x
+
+    def update(self, z_measured):
+        z = np.array([[z_measured]])
+        y = z - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (np.eye(2) - K @ self.H) @ self.P
+        return self.x
+
+
+_MAML = MAMLInnerOptimizer()
+
+
+def predictive_ota_control(selected_servers: List[Node], clients: List[Node], t_now, 
+                          target_snr=10.0, traffic=0.5, mobility=0.5) -> Dict:
+    """
+    Improved OTA power control that actually adapts to channel quality.
+    """
+    ota_results = {}
+    c = 3e8
+    power_saturations = 0
+
+    for server in selected_servers:
+        control_params = {}
+        
+        # Get current channels and SNRs
+        hs, snrs = [], []
+        for client in clients:
+            h = client.get_channel(server, t_now)
+            snr_val = max(client.compute_snr_to(server, t_now), 1e-12)
+            hs.append(np.array([h], dtype=np.complex128))
+            snrs.append(snr_val)
+
+        # Simple MRT beamforming
+        R = np.zeros((1, 1), dtype=np.complex128)
+        for h, snr in zip(hs, snrs):
+            R += snr * np.outer(h, h.conj())
+        eigvals, eigvecs = np.linalg.eigh(R)
+        w_star = eigvecs[:, np.argmax(eigvals)]
+
+        # MAML adaptation
+        adapted, sync_adj, _ = _MAML.maml_update(snrs, traffic=traffic, mobility=mobility)
+        power_scale = float(1 / (1 + np.exp(-adapted[0].item())))   # 0~1
+
+        for idx, client in enumerate(clients):
+            pos_c = client.get_position_at(t_now)
+            pos_s = server.get_position_at(t_now)
+            d_hat = np.linalg.norm(pos_c - pos_s) * 1000.0
+            tau_base = d_hat / c
+
+            kf = KalmanTimingFilter(dt=1.0)  # Note: better to reuse KF per server if possible
+            kf.predict()
+            tau_filtered = kf.update(tau_base)[0, 0]
+            tau_window = tau_base + tau_filtered + sync_adj
+
+            channel_phase = np.angle(hs[idx][0])
+            pre_equalization_phase = -channel_phase + float(adapted[1].item()) + np.angle(w_star[0])
+
+            # === IMPROVED POWER CALCULATION ===
+            base_required_power = target_snr / snrs[idx]          # Core term
+
+            # Much softer penalties
+            channel_penalty = 1.0 + 0.25 * (abs(channel_phase) / np.pi)
+            mobility_penalty = 1.0 + 0.3 * mobility
+            traffic_penalty = 1.0 + 0.3 * traffic
+
+            optimized_power = base_required_power * power_scale
+            optimized_power *= channel_penalty * mobility_penalty * traffic_penalty
+
+            # Clip
+            pre_clipped = optimized_power
+            optimized_power = float(np.clip(optimized_power, 1e-4, client.power))
+
+            if optimized_power >= client.power - 1e-6:
+                power_saturations += 1
+
+            control_params[client.id] = {
+                "power": optimized_power,
+                "phase": pre_equalization_phase,
+                "snr": snrs[idx],
+                "tau_window": float(tau_window),
+                "beamformer": w_star.copy(),
+                "requested_power": float(pre_clipped),
+                "max_power_clipped": optimized_power >= client.power - 1e-6,
+            }
+
+        ota_results[server.id] = control_params
+
+    if power_saturations > 0:
+        log.debug(
+            "predictive_ota_control: %d/%d client-server pairs saturated to max power",
+            power_saturations, len(clients) * len(selected_servers)
+        )
+
+    return ota_results
+
+
+def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float], thresh, alpha, beta, delta_list, N, t_now=None) -> List[Node]:
+    snr_map = {c: {s: c.compute_snr_to(s, t_now) for s in candidates} for c in clients}
+    best_snr = {c: 0.0 for c in clients}
+    S, total_cost = [], 0
+    candidates_cp = candidates.copy()
+    
+    if hasattr(greedy_server_selection, 'gnn_model'):
+        scores = predict_candidate_scores(
+            greedy_server_selection.gnn_model,
+            candidates_cp,
+            clients,
+            selected_servers=[]
+        )
+
+        sorted_candidates = sorted(
+            candidates_cp,
+            key=lambda x: scores.get(x, -1e9),
+            reverse=True
+        )
+
+        top_k = min(len(sorted_candidates), max(10, int(0.5 * len(sorted_candidates))))
+        candidates_cp = sorted_candidates[:top_k]
+
+    while candidates_cp:
+        best_server, best_gain = None, -float("inf")
+        current_utility = compute_utility(S, clients, alpha, beta, delta_list, snr_map=snr_map)
+
+        for server in candidates_cp:
+            new_utility = compute_utility(S + [server], clients, alpha, beta, delta_list, snr_map=snr_map)
+
+            gain = (current_utility - new_utility) / cost[server]
+            if gain > best_gain:
+                best_gain, best_server = gain, server
+
+        if best_server is None:
+            break
+
+        delta_snr = sum(max(0.0, snr_map[c][best_server] - best_snr[c]) for c in clients)
+        if delta_snr > thresh and total_cost + cost[best_server] <= budget:
+            S.append(best_server)
+            total_cost += cost[best_server]
+            # Update best_snr for the next iteration
+            for c in clients:
+                best_snr[c] = max(best_snr[c], snr_map[c][best_server])
+            if total_cost >= budget:
+                break
+
+        candidates_cp.remove(best_server)
+        
+    return S
+
+
+def _gnn_prune_candidates(candidates, clients, kappa=0.3, checkpoint=None):
+    try:
+        from models.gnn.train import load_gnn_for_inference, predict_candidate_scores
+        model = load_gnn_for_inference(checkpoint)
+        scored = predict_candidate_scores(model, candidates, clients)
+        keep = max(1, int(np.ceil(kappa * len(candidates))))
+        return [c for c, _ in sorted(scored.items(), key=lambda kv: kv[1], reverse=True)[:keep]]
+    except Exception:
+        return candidates
+
+
+def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, t_now=None,
+                                epsilon=0.15, alpha_cvar=0.10, N=64, coherence_time=25.0, sigma_snr=0.35,
+                                gnn_checkpoint=None, kappa=0.5, tau_amse=None):
+    from optimization.dro import bisect_lambda_for_amse_target
+    # Increase kappa from 0.15 to 0.30 to match greedy's pruning level (30% instead of 15%)
+    C = _gnn_prune_candidates(candidates, clients, kappa=kappa, checkpoint=gnn_checkpoint)
+    # C = candidates.copy()
+    for c in C:
+        print(f"Candidate {c.id} | Type: {c.type} | Cost: {cost[c]:.2f}")
+    scenario_maps = sample_snr_scenarios(clients, C, t_now, N=N,
+                                        coherence_time=coherence_time, sigma_snr=sigma_snr)
+    # Precompute latency map for this selection time to avoid repeated expensive calls
+    print(f"DR-Greedy: Sampled {N} SNR scenarios for {len(clients)} clients and {len(C)} candidates")
+    latency_map = {c: {s: c.get_latency_to(s, t_now) for s in C} for c in clients}
+    bundle = ScenarioBundle(scenarios=scenario_maps, clients=clients, candidates=C,
+                            delta_list=delta_list, alpha=alpha, beta=beta, latency_map=latency_map)
+    print(f"DR-Greedy: Starting robust selection with {len(C)} candidates and budget {budget}")
+    
+    S, total_cost, remaining = [], 0.0, list(C)   
+    while remaining:
+        best_v, best_score = None, -float('inf')
+        for v in remaining:
+            if total_cost + cost[v] > budget:
+                continue
+            
+            score, _ = robust_marginal_gain(S, v, bundle, epsilon=epsilon, alpha_cvar=alpha_cvar)
+            if score > best_score:
+                best_score, best_v = score, v
+        # Stop only when no feasible server exists or gain is genuinely negative
+        if best_v is None:
+            break
+        if best_score < -1 and len(S) > 0:
+            break
+        S.append(best_v)
+        total_cost += cost[best_v]
+        remaining.remove(best_v)
+
+        if tau_amse is not None:
+            bisect_lambda_for_amse_target(S, bundle, alpha_cvar, tau_amse)
+
+    if not S:
+        empty_obj = compute_utility([], clients, alpha, beta, delta_list)
+        best_v = None
+        best_val = float('inf')
+        for v in C:
+            if cost[v] > budget:
+                continue
+            value = compute_utility([v], clients, alpha, beta, delta_list, latency_map=latency_map)
+            if value < best_val:
+                best_val = value
+                best_v = v
+
+        if best_v is not None and best_val < empty_obj:
+            S.append(best_v)
+
+    return local_one_swap(S, C, budget, cost, bundle, epsilon=epsilon, alpha_cvar=alpha_cvar)
+
+```
+
+## optimization/__init__.py
+
+```python
+
+```
+
+## models/gnn/dataset.py
+
+```python
+from __future__ import annotations
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, random_split
+from torch_geometric.data import HeteroData
+
+from optimization.objective import compute_utility
+from simulation.topology.nodes import NodeType, generate_nodes
+
+
+class SAGINSnapshotDataset(Dataset):
+    def __init__(self, num_samples=10000, area_size=2000, gradient_dim=100, snr_threshold=1e-6, lhs_seed=42):
+        self.num_samples = num_samples
+        self.area_size = area_size
+        self.gradient_dim = gradient_dim
+        self.snr_threshold = snr_threshold
+        self.rng = np.random.default_rng(lhs_seed)
+        self.lhs = self._latin_hypercube(num_samples, 4)
+        self.cache = [None] * num_samples
+
+    def _latin_hypercube(self, n, d):
+        cut = np.linspace(0, 1, n + 1)
+        u = self.rng.uniform(size=(n, d))
+        a, b = cut[:-1], cut[1:]
+        pts = u * (b - a)[:, None] + a[:, None]
+        for j in range(d):
+            self.rng.shuffle(pts[:, j])
+        return pts
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        if self.cache[idx] is not None:
+            return self.cache[idx]
+        
+        p = self.lhs[idx]
+        clients_n = 125
+        sats = 9
+        uavs = 1
+        ground = 3
+        nodes = generate_nodes(sats, uavs, ground, clients_n, self.area_size, self.gradient_dim)
+        clients = [n for n in nodes if n.type == NodeType.CLIENT]
+        candidates = [n for n in nodes if n.type != NodeType.CLIENT]
+
+        # Build graph data (same as before)
+        data = HeteroData()
+        type_map = {NodeType.SATELLITE: 'satellite', NodeType.UAV: 'hap', 
+                    NodeType.GROUND: 'ground', NodeType.CLIENT: 'client'}
+        node_to_local = {}
+        node_objects = {t: [] for t in type_map.values()}
+
+        for n in nodes:
+            tname = type_map[n.type]
+            node_objects[tname].append(n)
+            type_feat = {
+                NodeType.SATELLITE: [1,0,0,0],
+                NodeType.UAV: [0,1,0,0],
+                NodeType.GROUND: [0,0,1,0],
+                NodeType.CLIENT: [0,0,0,1],
+            }[n.type]
+
+            feat = np.array([*n.position, n.power, n.noise_variance, *type_feat], dtype=np.float32)
+            node_to_local[n.id] = (tname, len(data[tname].x) if hasattr(data, tname) and data[tname].x else 0)
+            if not hasattr(data, tname) or not data[tname].x:
+                data[tname].x = []
+            data[tname].x.append(feat)
+
+        for t in type_map.values():
+            if hasattr(data[t], 'x') and data[t].x:
+                data[t].x = torch.tensor(np.array(data[t].x), dtype=torch.float32)
+
+        # === PAPER-ALIGNED BASE SELECTION (diverse tiers) ===
+        selected = []
+        for tier in [NodeType.GROUND, NodeType.UAV, NodeType.SATELLITE]:
+            tier_nodes = [n for n in candidates if n.type == tier]
+            if tier_nodes:
+                selected.append(tier_nodes[self.rng.integers(len(tier_nodes))])
+
+        edge_store = {}
+        edge_attr_store = {}
+        for c in clients:
+            for s in candidates:
+                snr = c.compute_snr_to(s)
+
+                if (
+                    not np.isfinite(snr)
+                    or snr < self.snr_threshold
+                ):
+                    continue
+
+                if c.id == s.id:
+                    continue
+
+                src_t, src_i = node_to_local[c.id]
+                dst_t, dst_i = node_to_local[s.id]
+
+                # Forward edge:
+                # client -> server
+                et = (src_t, 'link', dst_t)
+                edge_store.setdefault(et, [[], []])
+                edge_store[et][0].append(src_i)
+                edge_store[et][1].append(dst_i)
+
+                edge_attr_store.setdefault(et, [])
+                edge_attr_store[et].append([float(snr)])
+
+                # Reverse edge:
+                # server -> client
+                rev_et = (dst_t, 'rev_link', src_t)
+                edge_store.setdefault(rev_et, [[], []])
+                edge_store[rev_et][0].append(dst_i)
+                edge_store[rev_et][1].append(src_i)
+
+                edge_attr_store.setdefault(rev_et, [])
+                edge_attr_store[rev_et].append([float(snr)])
+
+        for et, eidx in edge_store.items():
+            data[et].edge_index = torch.tensor(eidx, dtype=torch.long)
+            data[et].edge_attr = torch.tensor(
+                edge_attr_store[et],
+                dtype=torch.float32
+            )
+            
+        label_dict = getattr(self, "labels_cache", None)
+
+        if label_dict is not None and idx in label_dict:
+            for t in ['satellite', 'hap', 'ground']:
+                if t in data.node_types:
+                    data[t].y = label_dict[idx][t]
+
+        self.cache[idx] = data
+        return data
+    
+    def precompute_labels(self):
+        print("[Dataset] Precomputing labels...")
+        
+        self.labels_cache = {}
+        for idx in range(self.num_samples):            
+            print(f"[Dataset] processing sample {idx}/{self.num_samples}")
+            
+            clients_n = 500
+
+            nodes = generate_nodes(
+                num_sats=36, num_uavs=8, num_ground=20, 
+                num_clients=clients_n, 
+                area_size=self.area_size, 
+                gradient_dim=self.gradient_dim
+            )
+            
+            clients = [n for n in nodes if n.type == NodeType.CLIENT]
+            candidates = [n for n in nodes if n.type != NodeType.CLIENT]
+            
+            selected = []
+            for tier in [NodeType.GROUND, NodeType.UAV, NodeType.SATELLITE]:
+                tier_nodes = [n for n in candidates if n.type == tier]
+                if tier_nodes:
+                    selected.append(tier_nodes[self.rng.integers(len(tier_nodes))])
+
+            base_utility = compute_utility(
+                selected, clients, alpha=0.65, beta=0.35, delta_list=[0.1, 0.05]
+            )
+
+            # Label generation per tier
+            placement_types = ['satellite', 'hap', 'ground']
+            type_map = {
+                    NodeType.SATELLITE: 'satellite',
+                    NodeType.UAV: 'hap',
+                    NodeType.GROUND: 'ground'
+                }
+            
+            label_dict = {}
+            for t in placement_types:
+                tier_nodes = [n for n in candidates if type_map.get(n.type) == t]
+                labels = []
+                for candidate in tier_nodes:
+                    new_servers = list(selected)
+                    if candidate not in new_servers:
+                        new_servers.append(candidate)
+                    new_utility = compute_utility(new_servers, clients, alpha=0.65, beta=0.35, delta_list=[0.1, 0.05])
+                    marginal_gain = base_utility - new_utility
+                    labels.append(float(marginal_gain))
+
+                labels = np.asarray(labels, dtype=np.float32)
+                if len(labels) > 1:
+                    labels = (labels - labels.mean()) / (labels.std() + 1e-6)
+                    
+                label_dict[t] = torch.tensor(labels, dtype=torch.float32)
+                
+            self.labels_cache[idx] = label_dict
+
+            if idx % 50 == 0:
+                print(f"[Dataset] Precomputed {idx}/{self.num_samples}")
+
+        print("[Dataset] Done precomputing labels.")
+
+
+def get_gnn_datasets(num_samples=14000, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    """Returns train, val, test datasets with proper split ratios."""
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6
+
+    full_dataset = SAGINSnapshotDataset(num_samples=num_samples, lhs_seed=seed)
+
+    train_size = int(train_ratio * num_samples)
+    val_size = int(val_ratio * num_samples)
+    test_size = num_samples - train_size - val_size
+
+    train_ds, val_ds, test_ds = random_split(full_dataset, [train_size, val_size, test_size],
+                                                generator=torch.Generator().manual_seed(seed))
+
+    # Attach the same labels cache to all splits
+    full_dataset.precompute_labels()
+    for ds in (train_ds, val_ds, test_ds):
+        ds.dataset.labels_cache = full_dataset.labels_cache  # share labels
+
+    return train_ds, val_ds, test_ds
+
+```
+
+## models/gnn/hgnn.py
+
+```python
+from __future__ import annotations
+
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import HeteroConv, GATConv
+
+
+class SAGINHeteroGNN(nn.Module):
+    def __init__(self, metadata, in_dims, hidden_dim=128, layers=3, heads=4, dropout=0.2):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        self.encoders = nn.ModuleDict({k: nn.Linear(v, hidden_dim) for k, v in in_dims.items()})
+        self.convs = nn.ModuleList()
+        for _ in range(layers):
+            conv_dict = {}
+            for etype in metadata[1]:
+                conv_dict[etype] = GATConv((-1, -1), hidden_dim // heads, heads=heads, add_self_loops=False)
+            self.convs.append(HeteroConv(conv_dict, aggr='sum'))
+            
+        self.heads = nn.ModuleDict({
+            "satellite": nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            ),
+            "hap": nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            ),
+            "ground": nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            ),
+            # optional safety for missing types
+            "client": nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            )
+        })
+
+    def forward(self, data, placement_mask):
+        x_dict = {k: F.relu(self.encoders[k](v)) for k, v in data.x_dict.items()}
+        for conv in self.convs:
+            out_dict = conv(x_dict, data.edge_index_dict)
+
+            for node_type in x_dict:
+                if node_type not in out_dict:
+                    out_dict[node_type] = x_dict[node_type]
+
+            x_dict = out_dict
+            x_dict = {k: F.dropout(F.relu(v), p=self.dropout, training=self.training) for k, v in x_dict.items()}
+
+        all_embeddings = torch.cat([x_dict[k] for k in x_dict], dim=0)
+        g_s = all_embeddings[placement_mask].mean(dim=0, keepdim=True) if placement_mask.any() else all_embeddings.mean(dim=0, keepdim=True)
+        pred = {}
+        for k, emb in x_dict.items():
+            ctx = g_s.repeat(emb.size(0), 1)
+            h = torch.cat([emb, ctx], dim=-1)
+
+            if k in self.heads:
+                pred[k] = F.relu(self.heads[k](h).squeeze(-1))
+            else:
+                pred[k] = F.relu(self.heads["ground"](h).squeeze(-1))
+
+        return pred
+
+
+class SubmodularityRegularizer(nn.Module):
+    def forward(self, gain_a, gain_b):
+        return F.relu(gain_b - gain_a).mean()
+
+
+class SNRGradientPenalty(nn.Module):
+    def forward(self, preds, snr_feature):
+        grads = torch.autograd.grad(preds.sum(), snr_feature, create_graph=True, retain_graph=True, allow_unused=True)[0]
+        if grads is None:
+            return torch.tensor(0.0, device=preds.device)
+        return (grads ** 2).mean()
+
+```
+
+## models/gnn/precompute_dataset.py
+
+```python
+import shutil
+
+from models.gnn.dataset import get_gnn_datasets
+import torch
+import os
+
+train_ds, val_ds, test_ds = get_gnn_datasets(num_samples=14000, seed=42)
+
+output_dir = "precomputed_dataset"
+if os.path.exists(output_dir):
+    shutil.rmtree(output_dir)
+os.makedirs(output_dir, exist_ok=True)
+
+for i, data in enumerate(train_ds):
+    torch.save(data, f"{output_dir}/sample_train_{i}.pt")
+
+for i, data in enumerate(val_ds):
+    torch.save(data, f"{output_dir}/sample_val_{i}.pt")
+
+for i, data in enumerate(test_ds):
+    torch.save(data, f"{output_dir}/sample_test_{i}.pt")
+
+print("Precomputation done: train/val/test splits created.")
+```
+
+## models/gnn/train.py
+
+```python
+from __future__ import annotations
+from pathlib import Path
+import torch
+import torch.nn.functional as F
+import yaml
+from torch_geometric.loader import DataLoader
+import pickle
+from torch.utils.data import Dataset
+
+from models.gnn.hgnn import SAGINHeteroGNN, SubmodularityRegularizer, SNRGradientPenalty
+
+
+class PrecomputedGraphDataset(Dataset):
+    def __init__(self, path="precomputed_dataset", split="train"):
+        self.files = sorted(Path(path).glob(f"sample_{split}_*.pt"))
+        if not self.files:
+            self.files = sorted(Path(path).glob("sample_*.pt"))  # fallback
+        print(f"[Dataset] Loaded {len(self.files)} {split} samples from {path}")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        return torch.load(self.files[idx])
+
+
+def train_gnn(epochs=200, batch_size=32, lr=1e-3, checkpoint_path='checkpoints/sagin_hgnn.pt'):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[GNN Training] Using device: {device} | CUDA available: {torch.cuda.is_available()}")
+
+    # === Load Precomputed Datasets (No generation here) ===
+    train_ds = PrecomputedGraphDataset(path="precomputed_dataset", split="train")
+    val_ds   = PrecomputedGraphDataset(path="precomputed_dataset", split="val")
+    test_ds  = PrecomputedGraphDataset(path="precomputed_dataset", split="test")
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
+                              pin_memory=True, num_workers=4)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, 
+                              pin_memory=True, num_workers=2)
+
+    # Load one sample for metadata
+    sample = torch.load("precomputed_dataset/sample_train_0.pt") if train_ds.files else torch.load("precomputed_dataset/sample_0.pt")
+    in_dims = {k: sample[k].x.shape[1] for k in sample.node_types}
+
+    model = SAGINHeteroGNN(sample.metadata(), in_dims=in_dims).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=1e-4)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    mse = torch.nn.MSELoss()
+    submod_reg = SubmodularityRegularizer()
+    snr_penalty = SNRGradientPenalty()
+    best_val_loss = float('inf')
+    no_improve_epochs = 0
+    patience = 20
+    accumulation_steps = 2
+
+    print("=" * 70)
+    print(f"Dataset → Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
+    print(f"Batch size: {batch_size} | Epochs: {epochs}")
+    print("=" * 70)
+
+    for epoch in range(epochs):
+        # ====================== TRAINING ======================
+        model.train()
+        epoch_loss = 0.0
+
+        opt.zero_grad()
+        for batch_idx, batch in enumerate(train_loader):
+            batch = batch.to(device)
+            for nt in batch.node_types:
+                if hasattr(batch[nt], 'x'):
+                    batch[nt].x.requires_grad_(True)
+
+            total_nodes = sum(batch[k].x.size(0) for k in batch.node_types)
+            placement_mask = torch.zeros(total_nodes, dtype=torch.bool, device=device)
+
+            preds = model(batch, placement_mask)
+
+            loss = 0.0
+            for nt in preds:
+                if not hasattr(batch[nt], 'y') or batch[nt].y is None:
+                    continue
+                y = batch[nt].y.float().view(-1)
+                pred = preds[nt].view(-1)
+                min_len = min(pred.size(0), y.size(0))
+
+                if min_len == 0:
+                    continue
+
+                mse_part = mse(pred[:min_len], y[:min_len])
+                lsub_part = torch.tensor(0.0, device=device)
+                lsnr_part = torch.tensor(0.0, device=device)
+
+                if min_len > 1:
+                    lsub_part = submod_reg(pred[:min_len - 1], pred[1:min_len])
+
+                if batch[nt].x.size(1) > 2:
+                    snr_feature = batch[nt].x[:min_len, 2]
+                    if snr_feature.requires_grad:
+                        lsnr_part = snr_penalty(pred[:min_len], snr_feature)
+
+                loss += mse_part + 0.1 * lsub_part + 0.05 * lsnr_part
+
+            loss = loss / accumulation_steps
+            loss.backward()
+
+            if (batch_idx + 1) % accumulation_steps == 0 or batch_idx + 1 == len(train_loader):
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad()
+            else:
+                grad_norm = float('nan')
+
+            epoch_loss += loss.item() * accumulation_steps
+
+            if batch_idx % 10 == 0:
+                print(f"[Epoch {epoch+1:02d}] Batch {batch_idx:03d}/{len(train_loader)} | "
+                      f"Loss={loss.item() * accumulation_steps:.6f} | Grad={grad_norm:.4f}")
+
+        # ====================== VALIDATION ======================
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = batch.to(device)
+                placement_mask = torch.zeros(
+                    sum(batch[k].x.size(0) for k in batch.node_types),
+                    dtype=torch.bool, device=device
+                )
+                preds = model(batch, placement_mask)
+                batch_loss = 0.0
+                for nt in preds:
+                    if not hasattr(batch[nt], 'y') or batch[nt].y is None:
+                        continue
+                    y = batch[nt].y.float().view(-1)
+                    pred = preds[nt].view(-1)
+                    min_len = min(pred.size(0), y.size(0))
+                    batch_loss += mse(pred[:min_len], y[:min_len]).item()
+                val_loss += batch_loss
+
+        val_loss /= max(len(val_loader), 1)
+        avg_train_loss = epoch_loss / len(train_loader)
+
+        # ====================== SCHEDULER + LOGGING ======================
+        sch.step()
+        current_lr = sch.get_last_lr()[0]
+
+        print(
+            f"\n[Epoch {epoch+1:02d}/{epochs}] "
+            f"AvgTrainLoss={avg_train_loss:.6f} | "
+            f"ValLoss={val_loss:.6f} | "
+            f"LR={current_lr:.8f}"
+        )
+
+        if torch.cuda.is_available():
+            print(f"GPU Memory Allocated: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
+
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            no_improve_epochs = 0
+            Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"  → Best model saved (ValLoss = {val_loss:.6f})")
+        else:
+            no_improve_epochs += 1
+            print(f"  → No improvement for {no_improve_epochs}/{patience} epochs")
+            if no_improve_epochs >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs.")
+                break
+
+    # ====================== FINAL SAVE ======================
+    Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), checkpoint_path)
+    
+    meta_path = Path(checkpoint_path).with_suffix('.meta.pkl')
+    with open(meta_path, 'wb') as f:
+        pickle.dump({'metadata': sample.metadata(), 'in_dims': in_dims}, f)
+
+    _write_checkpoint_to_config(checkpoint_path)
+    print(f"\n[GNN] Training completed. Best model saved to {checkpoint_path}")
+    print(f"Final Best Validation Loss: {best_val_loss:.6f}")
+    return checkpoint_path
+
+
+def _write_checkpoint_to_config(path):
+    cfg_path = Path('configs/default.yaml')
+    cfg = yaml.safe_load(cfg_path.read_text())
+    cfg.setdefault('gnn', {})
+    cfg['gnn']['checkpoint'] = path
+    cfg['gnn'].setdefault('kappa', 0.15)
+    cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+
+
+def load_gnn_for_inference(checkpoint=None):
+    if checkpoint is None:
+        checkpoint = 'checkpoints/sagin_hgnn.pt'
+    ckpt_path = Path(checkpoint)
+    meta_path = ckpt_path.with_suffix('.meta.pkl')
+    if not ckpt_path.exists() or not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
+        m = SAGINHeteroGNN(meta['metadata'], in_dims=meta['in_dims'])
+        m.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
+        m.eval()
+        return m
+    except Exception as e:
+        print(f"[GNN] load failed: {e}")
+        return None
+
+
+def predict_candidate_scores(model, candidates, clients, selected_servers=None):
+    if model is None:
+        return {c: 0.0 for c in candidates}
+    import numpy as np
+    from torch_geometric.data import HeteroData
+    from simulation.topology.nodes import NodeType
+
+    type_map = {NodeType.SATELLITE: 'satellite', NodeType.UAV: 'hap',
+                NodeType.GROUND: 'ground', NodeType.CLIENT: 'client'}
+    data = HeteroData()
+    node_to_local = {}
+    for t in type_map.values():
+        data[t].x = []
+
+    for n in list(candidates) + list(clients):
+        tname = type_map[n.type]
+        feat = np.array([
+            *n.position,
+            n.power,
+            n.noise_variance,
+            float(n.type == NodeType.SATELLITE),
+            float(n.type == NodeType.UAV),
+            float(n.type == NodeType.GROUND),
+            float(n.type == NodeType.CLIENT),
+        ], dtype=np.float32)
+        node_to_local[n.id] = (tname, len(data[tname].x))
+        data[tname].x.append(feat)
+
+    for t in type_map.values():
+        rows = data[t].x
+        data[t].x = (torch.tensor(np.array(rows), dtype=torch.float32)
+                     if rows else torch.zeros((0, 6), dtype=torch.float32))
+
+    edge_store = {}
+    for c in clients:
+        for s in candidates:
+            if c.compute_snr_to(s) < 1e-6:
+                continue
+            st, si = node_to_local[c.id]
+            dt, di = node_to_local[s.id]
+            et = (st, 'link', dt)
+            edge_store.setdefault(et, [[], []])
+            edge_store[et][0].append(si)
+            edge_store[et][1].append(di)
+    for et, eidx in edge_store.items():
+        data[et].edge_index = torch.tensor(eidx, dtype=torch.long)
+
+    placement_mask = torch.zeros(
+        sum(data[k].x.size(0) for k in data.node_types), dtype=torch.bool)
+    try:
+        with torch.no_grad():
+            preds = model(data, placement_mask)
+    except Exception as e:
+        print(f"[GNN] inference error: {e}")
+        return {c: 0.0 for c in candidates}
+
+    scores = {}
+    for c in candidates:
+        tname, idx = node_to_local[c.id]
+        scores[c] = float(preds[tname][idx].item()) if (
+            tname in preds and idx < preds[tname].size(0)) else 0.0
+        
+    for c in candidates:
+        if c.type == NodeType.SATELLITE:
+            scores[c] *= 0.6      # downweight sats
+        elif c.type == NodeType.UAV:
+            scores[c] *= 0.85
+    
+    return scores
+
+
+if __name__ == '__main__':
+    train_gnn()
+
+```
+
+## models/gnn/__init__.py
+
+```python
+
+```
+
+## graph/graph_builder.py
+
+```python
+import networkx as nx
+from typing import List, Tuple
+
+from torch_geometric.data import HeteroData
+import torch
+import numpy as np
+
+from simulation.topology.nodes import (
+    Node,
+    NodeType,
+    generate_nodes,
+)
+
+from simulation.network.models import PathLossModel
+
+
+def build_graph(
+    num_sats=3,
+    num_uavs=5,
+    num_ground=10,
+    num_clients=20,
+    area_size=2000,
+) -> Tuple[nx.Graph, List[Node]]:
+
+    nodes = generate_nodes(
+        num_sats=num_sats,
+        num_uavs=num_uavs,
+        num_ground=num_ground,
+        num_clients=num_clients,
+        area_size=area_size,
+    )
+
+    graph = nx.Graph()
+
+    for node in nodes:
+
+        graph.add_node(
+            node.id,
+            node_type=node.type.value,
+            position=node.position.tolist(),
+        )
+
+    network_model = PathLossModel()
+
+    for i, source in enumerate(nodes):
+
+        for target in nodes[i + 1:]:
+
+            try:
+                latency = network_model.latency(
+                    source,
+                    target,
+                )
+
+            except Exception:
+                continue
+
+            graph.add_edge(
+                source.id,
+                target.id,
+                latency=float(latency),
+            )
+
+    return graph, nodes
+
+
+def build_graph_snapshot(
+    candidates,
+    clients,
+    selected_servers=None,
+):
+
+    if selected_servers is None:
+        selected_servers = []
+
+    data = HeteroData()
+
+    type_map = {
+        NodeType.SATELLITE: "satellite",
+        NodeType.UAV: "hap",
+        NodeType.GROUND: "ground",
+        NodeType.CLIENT: "client",
+    }
+
+    node_to_local = {}
+
+    all_nodes = list(candidates) + list(clients)
+
+    for t in type_map.values():
+        data[t].x = []
+
+    for n in all_nodes:
+
+        tname = type_map[n.type]
+
+        type_feat = {
+            NodeType.SATELLITE: [1, 0, 0, 0],
+            NodeType.UAV: [0, 1, 0, 0],
+            NodeType.GROUND: [0, 0, 1, 0],
+            NodeType.CLIENT: [0, 0, 0, 1],
+        }[n.type]
+
+        pos = np.asarray(n.position)
+
+        feat = np.array(
+            [
+                *pos,
+                np.log10(max(n.power, 1e-9)),
+                np.log10(max(n.noise_variance, 1e-12)),
+                *type_feat,
+                float(n in selected_servers),
+            ],
+            dtype=np.float32,
+        )
+
+        node_to_local[n.id] = (
+            tname,
+            len(data[tname].x),
+        )
+
+        data[tname].x.append(feat)
+
+    for t in type_map.values():
+
+        if len(data[t].x) == 0:
+            continue
+
+        data[t].x = torch.tensor(
+            np.array(data[t].x),
+            dtype=torch.float32,
+        )
+
+    edge_store = {}
+    edge_attr_store = {}
+
+    for c in clients:
+
+        for s in candidates:
+
+            try:
+                snr = c.compute_snr_to(s)
+
+            except Exception:
+                continue
+
+            if not np.isfinite(snr):
+                continue
+
+            src_t, src_i = node_to_local[c.id]
+            dst_t, dst_i = node_to_local[s.id]
+
+            et = (src_t, "link", dst_t)
+
+            edge_store.setdefault(et, [[], []])
+
+            edge_store[et][0].append(src_i)
+            edge_store[et][1].append(dst_i)
+
+            edge_attr_store.setdefault(et, [])
+
+            edge_attr_store[et].append([
+                float(np.log10(snr + 1e-9))
+            ])
+
+    for et, eidx in edge_store.items():
+
+        data[et].edge_index = torch.tensor(
+            eidx,
+            dtype=torch.long,
+        )
+
+        data[et].edge_attr = torch.tensor(
+            edge_attr_store[et],
+            dtype=torch.float32,
+        )
+
+        rev_et = (et[2], "rev_link", et[0])
+
+        rev_edge_index = torch.stack(
+            [
+                data[et].edge_index[1],
+                data[et].edge_index[0],
+            ],
+            dim=0,
+        )
+
+        data[rev_et].edge_index = rev_edge_index
+
+        data[rev_et].edge_attr = (
+            data[et].edge_attr.clone()
+        )
+
+    node_maps = {}
+
+    for t in ["satellite", "hap", "ground"]:
+
+        node_maps[t] = {}
+
+        idx = 0
+
+        for n in candidates:
+
+            if type_map[n.type] == t:
+                node_maps[t][idx] = n
+                idx += 1
+
+    return data, node_maps
+```
+
+## graph/__init__.py
+
+```python
+"""Graph utilities for SAGIN GNN preparation."""
+
+from .graph_builder import build_graph
+
+```

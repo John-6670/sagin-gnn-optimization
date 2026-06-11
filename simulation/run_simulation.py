@@ -15,7 +15,7 @@ from simulation.traffic.traffic_generator import generate_spatiotemporal_traffic
 from simulation.environment.weather import TwoStateWeatherMarkov
 from simulation.evaluation.metrics import compute_e2e_latency, compute_total_energy, compute_cvar
 from optimization.placement import predictive_ota_control
-from optimization.baselines import da_selection, lop_selection, go_selection, nrs_selection, random_selection, dr_selection
+from optimization.baselines import da_selection, lop_selection, go_selection, nrs_selection, random_selection, dr_selection, fedsn_selection
 from fl.tasks import get_task_registry
 from fl.trainer import FederatedRound
 from fl.convergence import convergence_monitor
@@ -525,6 +525,24 @@ def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours,
         
         lat = compute_e2e_latency(clients, selected, t_now)
         energy = compute_total_energy(clients, selected, ota, transmission_time=time_step_seconds, t_now=t_now)
+        
+        # === INSERT FEDSN EMULATION LOGIC ===
+        if tag.lower() == "fedsn":
+            orig_lat = lat
+            orig_energy = energy
+            
+            # FedSN uses sub-structure pruning (e.g., 50% parameter payload size reduction)
+            # This scales down transmission energy consumption linearly
+            energy = energy * 0.5 
+            
+            # Pseudo-asynchronous window components add a lag/staleness latency penalty 
+            # because the aggregator must wait for out-of-sync partial updates from past orbits
+            lat = lat * 1.35
+            
+            print(f"[FedSN Simulation Step] Timestep: {t_now} | Active Clients: {len(clients)} | Selected Aggregators: {len(selected)}")
+            print(f"  |- Original Network Metrics -> Energy: {orig_energy:.4f} J, Latency: {orig_lat:.4f}s")
+            print(f"  |- FedSN Adjusted Metrics   -> Energy (0.5x Sub-Model): {energy:.4f} J, Latency (1.35x Asynchronous Staleness): {lat:.4f}s")
+        
         amse = float(np.mean(amse_vals)) if amse_vals else 0.0
         window_size = 30
         # CVaR computed on past window only (exclude current step to avoid trending up with AMSE)
@@ -720,11 +738,12 @@ def main():
 
     # ====================== Algorithms Dictionary ======================
     algorithms = {
-        "lop": lop_selection,
-        "go": go_selection,
-        "nrs": nrs_selection,
-        "random": random_selection,
-        "da": da_selection,
+        # "lop": lop_selection,
+        # "go": go_selection,
+        # "nrs": nrs_selection,
+        # "random": random_selection,
+        # "da": da_selection,
+        "fedsn": fedsn_selection,
         "dr_greedy": dr_selection,
     }
 

@@ -11,7 +11,7 @@ if not files:
     raise SystemExit('no result csv files found in results/')
 
 metrics = ['latency', 'amse', 'energy', 'cvar5']
-KNOWN_ALGOS = ['dr_greedy', 'greedy', 'lop', 'go', 'nrs', 'random', 'da']
+KNOWN_ALGOS = ["da", "lop", "go", "nrs", "dr", "random", "fedsn"]
 DISPLAY_NAME = {
     'dr_greedy': 'proposed_dr_greedy',
     'greedy': 'greedy',
@@ -20,6 +20,7 @@ DISPLAY_NAME = {
     'nrs': 'nrs',
     'random': 'random',
     'da': 'da',
+    'fedsn': 'fedsn'
 }
 
 
