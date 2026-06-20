@@ -15,7 +15,7 @@ from simulation.traffic.traffic_generator import generate_spatiotemporal_traffic
 from simulation.environment.weather import TwoStateWeatherMarkov
 from simulation.evaluation.metrics import compute_e2e_latency, compute_total_energy, compute_cvar
 from optimization.placement import predictive_ota_control
-from optimization.baselines import da_selection, lop_selection, go_selection, nrs_selection, random_selection, dr_selection, fedsn_selection
+from optimization.baselines import da_selection, lop_selection, go_selection, nrs_selection, random_selection, dr_selection, fedsn_selection, hsfl_selection
 from fl.tasks import get_task_registry
 from fl.trainer import FederatedRound
 from fl.convergence import convergence_monitor
@@ -450,6 +450,8 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
                 continue
 
             log.info(f"[{alg_name}] Selected {len(selected)} servers")
+            if alg_name == "hsfl":
+                print("   [HSFL] Hierarchical Split FL baseline active — UAV-centric association")
 
             # === Run full FL training ===
             model = task.get_model()
@@ -686,7 +688,7 @@ def run_full_sweep(
                 losses = [r[2] for r in rows[-window_size:]] + [amse]
                 cvar_step = compute_cvar(losses, alpha=0.05)
                 rows.append((step, lat, amse, energy, cvar_step))
-                print('Step {}: latency={:.2f}s, amse={:.6f}, energy={:.2f}J, CVaR5%={:.6f}'.format(step, lat, amse, energy, cvar_step))
+                print('Step {}: latency={:.2f}ms, amse={:.6f}, energy={:.2f}J, CVaR5%={:.6f}'.format(step, lat, amse, energy, cvar_step))
                     
                 # Debug logging for energy anomalies
                 if step > 0 and step % 10 == 0:
@@ -747,12 +749,13 @@ def main():
 
     # ====================== Algorithms Dictionary ======================
     algorithms = {
-        # "lop": lop_selection,
-        # "go": go_selection,
-        # "nrs": nrs_selection,
-        # "random": random_selection,
-        # "da": da_selection,
+        "lop": lop_selection,
+        "go": go_selection,
+        "nrs": nrs_selection,
+        "random": random_selection,
+        "da": da_selection,
         "fedsn": fedsn_selection,
+        "hsfl": hsfl_selection,
         "dr_greedy": dr_selection,
     }
 

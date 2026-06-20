@@ -1,7 +1,7 @@
 import numpy as np
-from typing import List
+from typing import Dict, List
 
-from optimization.objective import compute_amse_kn_from_snr
+from optimization.objective import compute_amse_kn_from_snr, compute_utility
 from optimization.placement import greedy_server_selection, dr_greedy_server_selection
 from simulation.topology.nodes import Node, NodeType
 
@@ -168,6 +168,105 @@ def fedsn_selection(candidates: List[Node], clients: List[Node], budget: float, 
 
     print(f"[FedSN] Final selection: {[s.id for s in selected]} | Total cost: {current_cost:.2f}/{budget}")
     return selected
+
+
+def hsfl_selection(
+    candidates: List[Node],
+    clients: List[Node],
+    budget: float,
+    cost: Dict[Node, float],
+    thresh: float = 0.0,
+    alpha: float = 0.5,
+    beta: float = 0.5,
+    delta_list=None,
+    N: int = 16,
+    t_now=None,
+    **kwargs
+) -> List[Node]:
+    """
+    HSFL (Hierarchical Split Federated Learning) baseline from arXiv:2601.13817v3
+    - Emphasizes hierarchical structure (UAV edge + Sat global)
+    - Device association + split-aware selection
+    """
+    print(f"\n[HSFL Baseline] Evaluating {len(candidates)} candidates, budget={budget}")
+
+    if not candidates or not clients:
+        return []
+
+    # Tier priority: UAVs preferred as edge aggregators
+    tier_priority = {NodeType.UAV: 3.0, NodeType.GROUND: 2.0, NodeType.SATELLITE: 1.0}
+
+    scores = []
+    for s in candidates:
+        snrs = [c.compute_snr_to(s, t_now) for c in clients]
+        lats = [c.get_latency_to(s, t_now) for c in clients]
+        
+        avg_snr = np.mean(snrs) if snrs else 0.0
+        avg_lat = np.mean(lats) if lats else float('inf')
+        tier_score = tier_priority.get(s.type, 1.0)
+        
+        # Heterogeneity proxy (higher variance = worse for aggregation)
+        hetero_proxy = np.std(snrs) if len(snrs) > 1 else 1.0
+        
+        # Split benefit: more offloading (higher tier) is better for resource-constrained devices
+        split_benefit = tier_score / 3.0
+        
+        utility = (0.45 * avg_snr) / (avg_lat + 1.0) * split_benefit - 0.25 * hetero_proxy
+        efficiency = utility / (cost.get(s, 1.0) + 1e-6)
+        
+        scores.append((s, efficiency, avg_snr, avg_lat, tier_score))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+
+    selected = []
+    total_cost = 0.0
+    for s, eff, snr, lat, tier in scores:
+        c_cost = cost.get(s, 1.0)
+        if total_cost + c_cost <= budget:
+            selected.append(s)
+            total_cost += c_cost
+            print(f"  → HSFL Selected {s.id} ({s.type.value}) | Eff={eff:.4f} | SNR={snr:.2f} | Lat={lat:.1f}ms")
+        else:
+            break
+
+    # Local refinement (mimics paper's iterative device association)
+    if len(selected) >= 1:
+        selected = _hsfl_local_refine(selected, candidates, clients, budget, cost, t_now)
+
+    print(f"[HSFL] Final: {[s.id for s in selected]} | Cost: {total_cost:.2f}/{budget}")
+    return selected
+
+
+def _hsfl_local_refine(selected, candidates, clients, budget, cost, t_now):
+    """Iterative refinement inspired by paper's device association + resource allocation"""
+    best_set = list(selected)
+    best_utility = compute_utility(best_set, clients, 0.5, 0.5, [0.1, 0.2])
+    
+    for _ in range(4):  # limited iterations for efficiency
+        improved = False
+        for i, s in enumerate(best_set):
+            for alt in candidates:
+                if alt in best_set:
+                    continue
+                if cost.get(alt, 1.0) > cost.get(s, 1.0) * 1.5:  # avoid too expensive swaps
+                    continue
+                    
+                trial = best_set[:i] + [alt] + best_set[i+1:]
+                trial_cost = sum(cost.get(x, 1.0) for x in trial)
+                if trial_cost > budget:
+                    continue
+                    
+                util = compute_utility(trial, clients, 0.5, 0.5, [0.1, 0.2])
+                if util < best_utility:   # lower utility = better
+                    best_set = trial
+                    best_utility = util
+                    improved = True
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+    return best_set
 
 
 def dr_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N, t_now=None, **kwargs):
