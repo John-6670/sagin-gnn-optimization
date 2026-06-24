@@ -50,24 +50,44 @@ def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, lat
     total_utility = 0.0
     total_amse = 0.0
     
-    # Precompute per-server aggregated AMSE
+    # 1. First Pass: Assign clients to their best server based strictly on SNR
+    client_to_server = {}
+    for client in clients:
+        best_s = None
+        best_snr_val = -1.0
+        for server in servers:
+            if snr_map is not None:
+                s_val = snr_map[client].get(server, 1e-12)
+            else:
+                s_val = client.compute_snr_to(server)
+            if s_val > best_snr_val:
+                best_snr_val = s_val
+                best_s = server
+        client_to_server[client] = best_s
+
+    # 2. Compute per-server aggregated AMSE only for assigned clients
     server_amse = {}
     server_amse_transformed = {}
+    sigma2 = 10.0  # default noise variance
+    gradient_dim = clients[0].gradient_dim if clients else 100
     
     for server in servers:
-        snr_dict = {}
-        for client in clients:
-            if snr_map is not None:
-                snr = snr_map[client].get(server, 1e-12)
-            else:
-                snr = client.compute_snr_to(server)
-            snr_dict[client] = max(snr, 1e-12)
+        assigned_clients = [c for c, s in client_to_server.items() if s == server]
         
-        # Compute aggregated AMSE for this server across all clients
-        sigma2 = 10.0  # default noise variance
-        gradient_dim = clients[0].gradient_dim if clients else 100
+        if not assigned_clients:
+            server_amse[server] = 0.0
+            server_amse_transformed[server] = 0.0
+            continue
+            
+        snr_dict = {}
+        for c in assigned_clients:
+            if snr_map is not None:
+                snr = snr_map[c].get(server, 1e-12)
+            else:
+                snr = c.compute_snr_to(server)
+            snr_dict[c] = max(snr, 1e-12)
+            
         server_amse[server] = compute_amse_n(snr_dict, sigma2, gradient_dim)
-        # transform AMSE to a log-scale score so multiplicative gaps become additive
         eps = 1e-18
         server_amse_transformed[server] = -np.log10(server_amse[server] + eps)
     

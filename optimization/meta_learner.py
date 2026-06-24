@@ -14,11 +14,17 @@ class MAMLInnerOptimizer:
         self.sync_mlp = nn.Sequential(nn.Linear(3, 16), nn.ReLU(), nn.Linear(16, 1))
         self.sync_opt = torch.optim.Adam(self.sync_mlp.parameters(), lr=meta_lr)
 
-    def _loss(self, snr_tensor, params):
-        power_scale = torch.sigmoid(params[0])
+    def _loss(self, snr_tensor, params, energy_weight: float = 2.0):
+        power_scale = torch.sigmoid(params[0])  # ∈ (0, 1)
         phase_bias = params[1]
         effective = snr_tensor * power_scale * torch.cos(phase_bias).abs().clamp(min=1e-3)
-        return torch.mean(1.0 / effective.clamp(min=1e-6))
+        # Relative target: each client should reach 80% of its own max-SNR (at full power)
+        per_client_target = 0.8 * snr_tensor.detach()
+        snr_deficit = torch.relu(per_client_target - effective) / per_client_target.clamp(min=1e-9)
+        quality_loss = torch.mean(snr_deficit)
+        # Minimize transmit power (energy_weight balances quality vs. energy)
+        energy_loss = energy_weight * power_scale
+        return quality_loss + energy_loss
 
     def adapt(self, snr_values):
         snr_t = torch.tensor(np.asarray(snr_values, dtype=np.float32) + 1e-6)

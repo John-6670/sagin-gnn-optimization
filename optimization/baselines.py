@@ -10,27 +10,37 @@ def lop_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_
     selected = []
     total_cost = 0
     C = candidates.copy()
-    
+    current_latency = float('inf')
+
     while C:
         best = None
         best_score = float('inf')
-        
+
         for s in C:
+            if total_cost + cost[s] > budget:
+                continue
             total_latency = sum(
-                min([c.get_latency_to(ss) for ss in selected + [s]])
+                min([c.get_latency_to(ss, t_now) for ss in selected + [s]])
                 for c in clients
             )
-            if total_cost + cost[s] <= budget and total_latency < best_score:
+            if total_latency < best_score:
                 best = s
                 best_score = total_latency
-        
+
         if best is None:
             break
-        
+
+        # Stop when marginal latency reduction is negligible relative to current latency
+        if selected and current_latency > 0:
+            improvement = (current_latency - best_score) / current_latency
+            if improvement < 0.01:  # < 1% improvement → not worth the extra server
+                break
+
         C.remove(best)
         total_cost += cost[best]
         selected.append(best)
-        
+        current_latency = best_score
+
     return selected
 
 
@@ -46,22 +56,23 @@ def go_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_l
         alpha=alpha,
         beta=beta,
         delta_list=delta_list,
-        N=N
+        N=N,
+        t_now=t_now,
     )
 
 
 def nrs_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N, t_now=None):
-    # same greedy but NO threshold
     return greedy_server_selection(
         candidates=candidates,
         clients=clients,
         budget=budget,
         cost=cost,
-        thresh=float("-inf"),  # disables threshold
+        thresh=float("-inf"),
         alpha=alpha,
         beta=beta,
         delta_list=delta_list,
-        N=N
+        N=N,
+        t_now=t_now,
     )
 
 

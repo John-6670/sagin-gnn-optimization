@@ -93,18 +93,13 @@ def predictive_ota_control(selected_servers: List[Node], clients: List[Node], t_
             channel_phase = np.angle(hs[idx][0])
             pre_equalization_phase = -channel_phase + float(adapted[1].item()) + np.angle(w_star[0])
 
-            # === IMPROVED POWER CALCULATION ===
-            base_required_power = target_snr / snrs[idx]          # Core term
-
-            # Much softer penalties
-            channel_penalty = 1.0 + 0.25 * (abs(channel_phase) / np.pi)
-            mobility_penalty = 1.0 + 0.3 * mobility
-            traffic_penalty = 1.0 + 0.3 * traffic
-
+            # === ENERGY-MINIMIZING POWER CALCULATION ===
+            # Target 80% of max achievable SNR — always feasible regardless of channel.
+            # MAML is trained to minimize power further while maintaining this fraction.
+            base_required_power = 0.8 * client.power
             optimized_power = base_required_power * power_scale
-            optimized_power *= channel_penalty * mobility_penalty * traffic_penalty
 
-            # Clip
+            # Clip — never exceed client.power, never go below noise floor
             pre_clipped = optimized_power
             optimized_power = float(np.clip(optimized_power, 1e-4, client.power))
 
@@ -132,12 +127,13 @@ def predictive_ota_control(selected_servers: List[Node], clients: List[Node], t_
     return ota_results
 
 
-def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float], thresh, alpha, beta, delta_list, N, t_now=None) -> List[Node]:
+def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float], thresh, alpha, beta, delta_list, N,
+                            t_now=None, target_snr=1.0, energy_weight=0.3) -> List[Node]:
     snr_map = {c: {s: c.compute_snr_to(s, t_now) for s in candidates} for c in clients}
     best_snr = {c: 0.0 for c in clients}
     S, total_cost = [], 0
     candidates_cp = candidates.copy()
-    
+
     if hasattr(greedy_server_selection, 'gnn_model'):
         scores = predict_candidate_scores(
             greedy_server_selection.gnn_model,
@@ -145,24 +141,29 @@ def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float]
             clients,
             selected_servers=[]
         )
-
-        sorted_candidates = sorted(
-            candidates_cp,
-            key=lambda x: scores.get(x, -1e9),
-            reverse=True
-        )
-
+        sorted_candidates = sorted(candidates_cp, key=lambda x: scores.get(x, -1e9), reverse=True)
         top_k = min(len(sorted_candidates), max(10, int(0.5 * len(sorted_candidates))))
         candidates_cp = sorted_candidates[:top_k]
 
     while candidates_cp:
+        # Early stop: all clients already meet target_snr from some selected server
+        if S and all(best_snr[c] >= target_snr for c in clients):
+            break
+
         best_server, best_gain = None, -float("inf")
         current_utility = compute_utility(S, clients, alpha, beta, delta_list, snr_map=snr_map)
 
         for server in candidates_cp:
             new_utility = compute_utility(S + [server], clients, alpha, beta, delta_list, snr_map=snr_map)
+            utility_gain = (current_utility - new_utility) / cost[server]
 
-            gain = (current_utility - new_utility) / cost[server]
+            # Energy proxy: fraction of clients whose SNR target this server satisfies.
+            # High value → clients can transmit at lower power → less energy.
+            energy_proxy = sum(
+                min(snr_map[c][server] / max(target_snr, 1e-9), 1.0) for c in clients
+            ) / max(len(clients), 1)
+
+            gain = utility_gain + energy_weight * energy_proxy
             if gain > best_gain:
                 best_gain, best_server = gain, server
 
@@ -173,25 +174,39 @@ def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float]
         if delta_snr > thresh and total_cost + cost[best_server] <= budget:
             S.append(best_server)
             total_cost += cost[best_server]
-            # Update best_snr for the next iteration
             for c in clients:
                 best_snr[c] = max(best_snr[c], snr_map[c][best_server])
             if total_cost >= budget:
                 break
 
         candidates_cp.remove(best_server)
-        
+
     return S
 
 
 def _gnn_prune_candidates(candidates, clients, kappa=0.3, checkpoint=None):
     try:
         from models.gnn.train import load_gnn_for_inference, predict_candidate_scores
+        import numpy as np
+        from collections import defaultdict
+        
         model = load_gnn_for_inference(checkpoint)
         scored = predict_candidate_scores(model, candidates, clients)
-        keep = max(1, int(np.ceil(kappa * len(candidates))))
-        return [c for c, _ in sorted(scored.items(), key=lambda kv: kv[1], reverse=True)[:keep]]
-    except Exception:
+        
+        grouped = defaultdict(list)
+        for c in candidates:
+            grouped[c.type].append(c)
+            
+        final_candidates = []
+        for c_type, group in grouped.items():
+            keep = max(1, int(np.ceil(kappa * len(group))))
+            sorted_group = sorted(group, key=lambda x: scored.get(x, -1e9), reverse=True)
+            final_candidates.extend(sorted_group[:keep])
+            
+        return final_candidates
+    except Exception as e:
+        import logging
+        logging.warning(f"GNN pruning failed: {e}")
         return candidates
 
 

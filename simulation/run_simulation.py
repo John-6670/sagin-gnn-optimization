@@ -432,16 +432,9 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
         client_loaders, test_loader = task.get_data_loaders(len(clients), seed=123)
 
         for alg_name, algo in algorithms.items():
-            if alg_name.lower() == "fedsn":
-                active_clients = [c for c in clients if np.random.rand() > 0.15]  # 15% dropout for orbit
-                snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in active_clients}
-                log.info(f"FedSN pseudo-sync: {len(active_clients)}/{len(clients)} active this round")
-            else:
-                active_clients = clients
-                    
             log.info(f"[{alg_name}] Running server placement...")
             selected = algo(
-                candidates=candidates, clients=active_clients, budget=budget, cost=cost,
+                candidates=candidates, clients=clients, budget=budget, cost=cost,
                 thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list
             )
 
@@ -450,8 +443,6 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
                 continue
 
             log.info(f"[{alg_name}] Selected {len(selected)} servers")
-            if alg_name == "hsfl":
-                print("   [HSFL] Hierarchical Split FL baseline active — UAV-centric association")
 
             # === Run full FL training ===
             model = task.get_model()
@@ -461,7 +452,7 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
             for r in range(num_rounds):
                 snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in clients}
                 res = FederatedRound(
-                    r, active_clients, selected, {}, task, model, client_loaders,
+                    r, clients, selected, {}, task, model, client_loaders,
                     test_loader, snr_map, delta_list, use_hybrid=True
                 )
                 amse_hist.append(res['amse'])
@@ -534,32 +525,17 @@ def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours,
         
         lat = compute_e2e_latency(clients, selected, t_now)
         energy = compute_total_energy(clients, selected, ota, transmission_time=time_step_seconds, t_now=t_now)
-        
-        if tag.lower() == "fedsn":
-            orig_lat = lat
-            orig_energy = energy
-            orig_amse = amse
-            
-            # Sub-structure emulation: reduce payload by ~40-60% (paper uses channel partitioning)
-            reduction_factor = 0.55  # adjustable
-            energy = energy * reduction_factor
-            
-            # Pseudo-synchronous: add staleness penalty based on mobility/orbit (higher for sats)
-            staleness_factor = 1.25 if any(s.type == NodeType.SATELLITE for s in selected) else 1.1
-            lat = lat * staleness_factor
-            
-            # Slight AMSE benefit from better aggregation (paper claims reduced info loss)
-            amse = amse * 0.92
-            
-            print(f"[FedSN Step] Original: E={orig_energy:.4f}J, Lat={orig_lat:.4f}s, AMSE={orig_amse:.6f}")
-            print(f"         Adjusted: E={energy:.4f}J (x{reduction_factor}), Lat={lat:.4f}s (x{staleness_factor}), AMSE={amse:.6f}")
-        
         amse = float(np.mean(amse_vals)) if amse_vals else 0.0
         window_size = 30
         # CVaR computed on past window only (exclude current step to avoid trending up with AMSE)
         losses = [r[2] for r in rows[-window_size:]]
-        cvar_step = compute_cvar(losses, alpha=0.05) if losses else amse
-        rows.append((step, lat, amse, energy, cvar_step))
+        cvar5 = compute_cvar(losses, alpha=0.05) if losses else amse
+        cvar10 = compute_cvar(losses, alpha=0.10) if losses else amse
+        cvar1 = compute_cvar(losses, alpha=0.01) if losses else amse
+        num_sat = sum(1 for s in selected if s.type.value == "sat")
+        num_uav = sum(1 for s in selected if s.type.value == "uav")
+        num_ground = sum(1 for s in selected if s.type.value == "ground")
+        rows.append((step, lat, amse, energy, cvar5, cvar10, cvar1, num_sat, num_uav, num_ground))
         
         # Re-selection every outer interval
         if (step * time_step_seconds) % (outer_interval_minutes * 60) == 0 and step > 0:
@@ -582,9 +558,9 @@ def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours,
     
     csv_path = f"results/{tag}_metrics.csv"
     with open(csv_path,'w') as f:
-        f.write('step,latency,amse,energy,cvar5\n')
+        f.write('step,latency,amse,energy,cvar95,cvar90,cvar99,num_sat,num_uav,num_ground\n')
         for r in rows:
-            f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]}\n")
+            f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]},{r[6]},{r[7]},{r[8]},{r[9]}\n")
     print(f"   Saved: {csv_path}")
 
 
@@ -669,8 +645,26 @@ def run_full_sweep(
                     
                 avg_traffic = float(np.mean([c.load for c in clients])) if clients else 0.5
                 avg_mobility = float(np.mean([np.linalg.norm(s.get_velocity_at(t_now)) for s in selected])) if selected else 0.0
+
+                # Real-time pruning: drop servers with zero marginal SNR contribution.
+                # O(|selected| * |clients|) per step; keeps at least one server.
+                if len(selected) > 1:
+                    snr_rt = {c: {sv: c.compute_snr_to(sv, t_now) for sv in selected} for c in clients}
+                    pruned = []
+                    for s in selected:
+                        marginal = sum(
+                            max(0.0, snr_rt[c][s] - max(
+                                (snr_rt[c][s2] for s2 in selected if s2 is not s), default=0.0
+                            ))
+                            for c in clients
+                        )
+                        if marginal > thresh:
+                            pruned.append(s)
+                    if pruned:
+                        selected = pruned
+
                 ota = predictive_ota_control(selected, clients, t_now, target_snr, traffic=avg_traffic, mobility=avg_mobility)
-    
+
                 amse_vals = []
                 for s in selected:
                     snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
@@ -686,9 +680,15 @@ def run_full_sweep(
                 # Use rolling window of last 30 steps for CVaR (matches outer_interval_minutes)
                 window_size = 30
                 losses = [r[2] for r in rows[-window_size:]] + [amse]
-                cvar_step = compute_cvar(losses, alpha=0.05)
-                rows.append((step, lat, amse, energy, cvar_step))
-                print('Step {}: latency={:.2f}ms, amse={:.6f}, energy={:.2f}J, CVaR5%={:.6f}'.format(step, lat, amse, energy, cvar_step))
+                cvar5 = compute_cvar(losses, alpha=0.05)
+                cvar10 = compute_cvar(losses, alpha=0.10)
+                cvar1 = compute_cvar(losses, alpha=0.01)
+                num_sat = sum(1 for s in selected if s.type.value == "sat")
+                num_uav = sum(1 for s in selected if s.type.value == "uav")
+                num_ground = sum(1 for s in selected if s.type.value == "ground")
+                rows.append((step, lat, amse, energy, cvar5, cvar10, cvar1, num_sat, num_uav, num_ground))
+                print('Step {}: lat={:.2f}s, amse={:.4f}, eng={:.2f}J, CVaR(95,90,99)=({:.4f},{:.4f},{:.4f}), Dev(S,U,G)=({},{},{})'.format(
+                    step, lat, amse, energy, cvar5, cvar10, cvar1, num_sat, num_uav, num_ground))
                     
                 # Debug logging for energy anomalies
                 if step > 0 and step % 10 == 0:
@@ -711,9 +711,9 @@ def run_full_sweep(
             tag = f"_{results_tag}" if results_tag else ""
             csv_path = f"results/{name}{tag}_metrics.csv"
             with open(csv_path,'w') as f:
-                f.write('step,latency,amse,energy,cvar5\n')
+                f.write('step,latency,amse,energy,cvar95,cvar90,cvar99,num_sat,num_uav,num_ground\n')
                 for r in rows:
-                    f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]}\n")
+                    f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]},{r[6]},{r[7]},{r[8]},{r[9]}\n")
 
 
 def main():
