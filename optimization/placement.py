@@ -5,6 +5,7 @@ from typing import List, Dict
 
 from simulation.topology.nodes import Node, NodeType
 from optimization.objective import compute_utility
+from simulation.topology.aircomp import compute_amse_n
 from optimization.dro import ScenarioBundle, sample_snr_scenarios, robust_marginal_gain, local_one_swap
 from optimization.meta_learner import MAMLInnerOptimizer
 from models.gnn.train import predict_candidate_scores
@@ -212,7 +213,7 @@ def _gnn_prune_candidates(candidates, clients, kappa=0.3, checkpoint=None):
 
 def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, t_now=None,
                                 epsilon=0.15, alpha_cvar=0.10, N=64, coherence_time=25.0, sigma_snr=0.35,
-                                gnn_checkpoint=None, kappa=0.5, tau_amse=None):
+                                gnn_checkpoint=None, kappa=0.3, tau_amse=None):
     from optimization.dro import bisect_lambda_for_amse_target
     # Increase kappa from 0.15 to 0.30 to match greedy's pruning level (30% instead of 15%)
     C = _gnn_prune_candidates(candidates, clients, kappa=kappa, checkpoint=gnn_checkpoint)
@@ -224,8 +225,24 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
     # Precompute latency map for this selection time to avoid repeated expensive calls
     print(f"DR-Greedy: Sampled {N} SNR scenarios for {len(clients)} clients and {len(C)} candidates")
     latency_map = {c: {s: c.get_latency_to(s, t_now) for s in C} for c in clients}
+    all_latencies = [latency_map[c][s] for c in clients for s in C]
+    import numpy as _np
+    latency_scale = max(_np.percentile(all_latencies, 95) if all_latencies else 1.0, 1e-6)
+
+    amse_scale_values = []
+    if clients:
+        sigma2 = float(np.mean([c.noise_variance for c in clients]))
+        gradient_dim = clients[0].gradient_dim
+        for snr_map in scenario_maps:
+            for s in C:
+                snr_dict = {c: max(snr_map[c].get(s, 1e-12), 1e-12) for c in clients}
+                amse_scale_values.append(compute_amse_n(snr_dict, sigma2, gradient_dim))
+    amse_scale = max(_np.percentile(amse_scale_values, 95) if amse_scale_values else 1.0, 1e-12)
+    
     bundle = ScenarioBundle(scenarios=scenario_maps, clients=clients, candidates=C,
-                            delta_list=delta_list, alpha=alpha, beta=beta, latency_map=latency_map)
+                            delta_list=delta_list, alpha=alpha, beta=beta,
+                            latency_map=latency_map, latency_scale=latency_scale,
+                            amse_scale=amse_scale)
     print(f"DR-Greedy: Starting robust selection with {len(C)} candidates and budget {budget}")
     
     S, total_cost, remaining = [], 0.0, list(C)   
@@ -257,7 +274,10 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
         for v in C:
             if cost[v] > budget:
                 continue
-            value = compute_utility([v], clients, alpha, beta, delta_list, latency_map=latency_map)
+            value = compute_utility(
+                [v], clients, alpha, beta, delta_list, latency_map=latency_map,
+                latency_scale=latency_scale, amse_scale=amse_scale,
+            )
             if value < best_val:
                 best_val = value
                 best_v = v

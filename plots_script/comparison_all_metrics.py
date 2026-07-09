@@ -77,12 +77,16 @@ for algo in algorithms:
         if i == 2:  # energy
             axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
             axs[i].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12, linewidth=1)
-            axs[i].set_ylim(0, mu.max() * 1.1 if not np.isnan(mu.max()) else 1)
+            # axs[i].set_ylim(0, mu.max() * 1.1 if not np.isnan(mu.max()) else 1)
         elif i == 1:  # amse
             axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=0.5)
             axs[i].fill_between(mu.index.values, np.clip((mu - ci).values, 1e-6, None), np.clip((mu + ci).values, 1e-6, None), alpha=0.12, linewidth=1)
             axs[i].set_yscale('log')
-        elif i == 0 or i > 6:  # latency or device counts
+        elif i == 0:
+            axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
+            axs[i].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12, linewidth=1)
+            # axs[i].set_ylim(0, mu.max() * 0.2)
+        elif i > 6:  # latency or device counts
             axs[i].plot(mu.index.values, mu.values, label=DISPLAY_NAME.get(algo, algo), linewidth=1)
             axs[i].fill_between(mu.index.values, (mu - ci).values, (mu + ci).values, alpha=0.12, linewidth=1)
         else:

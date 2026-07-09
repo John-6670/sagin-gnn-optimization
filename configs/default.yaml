@@ -9,8 +9,8 @@ simulation:
   algorithm: test
   num_scenarios: 8
   duration_hours: 6
-  time_step_seconds: 300
-  outer_interval_minutes: 60
+  time_step_seconds: 60
+  outer_interval_minutes: 30
 
 
 nodes:

@@ -20,6 +20,8 @@ class ScenarioBundle:
     alpha: float
     beta: float
     latency_map: Dict = None
+    latency_scale: float = None
+    amse_scale: float = None
 
 
 def sample_snr_scenarios(clients, candidates, t_now, N: int, coherence_time: float, sigma_snr: float, dt_seconds: float = 10.0):
@@ -44,7 +46,7 @@ def sample_snr_scenarios(clients, candidates, t_now, N: int, coherence_time: flo
     return scenarios
 
 
-def _cvar(values: Sequence[float], alpha_cvar: float) -> float:
+def _cvar(values: Sequence[float], alpha_cvar: float, tail: str = 'lower') -> float:
     if not values:
         return 0.0
     arr = np.asarray(values, dtype=float)
@@ -52,13 +54,18 @@ def _cvar(values: Sequence[float], alpha_cvar: float) -> float:
     arr = arr[np.isfinite(arr)]
     if arr.size == 0:
         return 0.0
-    q = np.quantile(arr, alpha_cvar)
-    tail = arr[arr <= q]
-    return float(np.mean(tail)) if len(tail) > 0 else float(q)
+    if tail == 'lower':
+        q = np.quantile(arr, alpha_cvar)
+        tail_vals = arr[arr <= q]
+    else:
+        q = np.quantile(arr, 1.0 - alpha_cvar)
+        tail_vals = arr[arr >= q]
+    return float(np.mean(tail_vals)) if len(tail_vals) > 0 else float(q)
 
 
 def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_cvar: float):
     scenario_gains = []
+    scenario_latency_deltas = []
     for idx, snr_map in enumerate(scenarios.scenarios, start=1):
         curr = compute_utility(
             S,
@@ -68,6 +75,8 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
             scenarios.delta_list,
             snr_map=snr_map,
             latency_map=getattr(scenarios, 'latency_map', None),
+            latency_scale=getattr(scenarios, 'latency_scale', None),
+            amse_scale=getattr(scenarios, 'amse_scale', None),
         )
 
         new = compute_utility(
@@ -78,10 +87,40 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
             scenarios.delta_list,
             snr_map=snr_map,
             latency_map=getattr(scenarios, 'latency_map', None),
+            latency_scale=getattr(scenarios, 'latency_scale', None),
+            amse_scale=getattr(scenarios, 'amse_scale', None),
         )
 
         gain = curr - new
         scenario_gains.append(gain)
+        # compute average min-latency before/after to capture latency impact
+        lat_map = getattr(scenarios, 'latency_map', None)
+        curr_lats = []
+        new_lats = []
+        for c in scenarios.clients:
+            # current config
+            if S:
+                lat_before = min([
+                    float(lat_map.get(c, {}).get(s, c.get_latency_to(s))) if lat_map is not None else float(c.get_latency_to(s))
+                    for s in S
+                ])
+            else:
+                lat_before = float('inf')
+
+            # new config
+            lat_candidates = S + [v]
+            lat_after = min([
+                float(lat_map.get(c, {}).get(s, c.get_latency_to(s))) if lat_map is not None else float(c.get_latency_to(s))
+                for s in lat_candidates
+            ])
+
+            curr_lats.append(lat_before if np.isfinite(lat_before) else 0.0)
+            new_lats.append(lat_after if np.isfinite(lat_after) else 0.0)
+
+        # average per-client min latency
+        avg_before = float(np.mean(curr_lats)) if curr_lats else 0.0
+        avg_after = float(np.mean(new_lats)) if new_lats else 0.0
+        scenario_latency_deltas.append(avg_after - avg_before)
         if len(scenarios.scenarios) >= 10 and idx % max(1, len(scenarios.scenarios)//10) == 0:
             logger.debug("  robust_marginal_gain progress: computed gains for %d/%d scenarios", idx, len(scenarios.scenarios))
 
@@ -102,17 +141,21 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
     mean_gain = float(np.mean(gains))
     std_gain = float(np.std(gains))
 
-    cvar = _cvar(gains.tolist(), alpha_cvar)
+    cvar = _cvar(gains.tolist(), alpha_cvar, tail='lower')
     penalty = epsilon * std_gain * 1.5
+    # penalize expected worst-case latency increases (upper-tail CVaR)
+    latency_cvar = _cvar(scenario_latency_deltas, alpha_cvar, tail='upper') if len(scenario_latency_deltas) > 0 else 0.0
+    LAMBDA_LATENCY = 0.5
 
-    robust_gain = cvar - penalty
-    
+    robust_gain = cvar - penalty - LAMBDA_LATENCY * float(latency_cvar)
+
     if robust_gain < 1e-6 and mean_gain > 0:
         robust_gain = mean_gain * 0.7
 
     return float(robust_gain), {
         'mean_gain': mean_gain,
         'cvar': float(cvar),
+        'latency_cvar': float(latency_cvar),
     }
 
 

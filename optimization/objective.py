@@ -41,7 +41,7 @@ def compute_amse_kn_from_snr(client, snr, delta_list, server=None):
     return (client.noise_variance * client.gradient_dim / snr) * cascaded_error * 1e-9
 
 
-def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, latency_map=None, fl_result=None, use_ota=True):
+def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, latency_map=None, fl_result=None, use_ota=True, latency_scale=None, amse_scale=None):
     from simulation.topology.aircomp import compute_amse_n
     
     if not servers:
@@ -50,35 +50,62 @@ def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, lat
     total_utility = 0.0
     total_amse = 0.0
     
-    # 1. First Pass: Assign clients to their best server based strictly on SNR
+    # Precompute per client-server latencies and per client-server AMSE proxy
+    all_latencies = []
+    per_pair_amse = []
+    per_client_server_amse = {}
+    for client in clients:
+        per_client_server_amse[client] = {}
+        for server in servers:
+            if latency_map is not None:
+                latency = float(latency_map.get(client, {}).get(server, client.get_latency_to(server)))
+            else:
+                latency = float(client.get_latency_to(server))
+            all_latencies.append(latency)
+
+            if snr_map is not None:
+                snr_val = snr_map[client].get(server, 1e-12)
+            else:
+                snr_val = client.compute_snr_to(server)
+
+            # per-client-server AMSE surrogate (kn)
+            amse_kn = compute_amse_kn_from_snr(client, max(snr_val, 1e-12), delta_list, server=server)
+            per_client_server_amse[client][server] = amse_kn
+            per_pair_amse.append(amse_kn)
+
+    # Normalize scales: use robust percentile to avoid extreme outliers dominating
+    import numpy as _np
+    latency_scale = max(float(latency_scale) if latency_scale is not None else (_np.percentile(all_latencies, 95) if all_latencies else 1.0), 1e-6)
+    amse_scale = max(float(amse_scale) if amse_scale is not None else (_np.percentile(per_pair_amse, 95) if per_pair_amse else 1.0), 1e-12)
+
+    # 2. First assignment: choose per-client best server using normalized weighted loss
     client_to_server = {}
     for client in clients:
-        best_s = None
-        best_snr_val = -1.0
+        best_server = None
+        best_cost = float('inf')
         for server in servers:
-            if snr_map is not None:
-                s_val = snr_map[client].get(server, 1e-12)
-            else:
-                s_val = client.compute_snr_to(server)
-            if s_val > best_snr_val:
-                best_snr_val = s_val
-                best_s = server
-        client_to_server[client] = best_s
-
-    # 2. Compute per-server aggregated AMSE only for assigned clients
+            latency = float(latency_map.get(client, {}).get(server, client.get_latency_to(server))) if latency_map is not None else float(client.get_latency_to(server))
+            raw_amse = per_client_server_amse.get(client, {}).get(server, float('inf'))
+            norm_lat, norm_amse = _normalize_latency_and_amse(latency, raw_amse, latency_scale, amse_scale)
+            load_factor = 1.0 + 0.3 * getattr(client, 'load', 0.0)
+            compound = weighted_compound_loss(norm_lat, norm_amse, alpha, beta) * load_factor
+            if compound < best_cost:
+                best_cost = compound
+                best_server = server
+        client_to_server[client] = best_server
+    
+    # Compute per-server aggregated AMSE only for assigned clients (final aggregated values)
     server_amse = {}
-    server_amse_transformed = {}
+    server_amse_cost = {}
     sigma2 = 10.0  # default noise variance
     gradient_dim = clients[0].gradient_dim if clients else 100
-    
+
     for server in servers:
         assigned_clients = [c for c, s in client_to_server.items() if s == server]
-        
         if not assigned_clients:
             server_amse[server] = 0.0
-            server_amse_transformed[server] = 0.0
+            server_amse_cost[server] = 0.0
             continue
-            
         snr_dict = {}
         for c in assigned_clients:
             if snr_map is not None:
@@ -86,45 +113,19 @@ def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, lat
             else:
                 snr = c.compute_snr_to(server)
             snr_dict[c] = max(snr, 1e-12)
-            
+
         server_amse[server] = compute_amse_n(snr_dict, sigma2, gradient_dim)
-        eps = 1e-18
-        server_amse_transformed[server] = -np.log10(server_amse[server] + eps)
-    
-    # Collect latencies per client-server pair for normalization
-    all_latencies = []
-    # use transformed AMSE values for normalization and scoring
-    all_server_amses = list(server_amse_transformed.values())
-    
+        server_amse_cost[server] = server_amse[server]
+
+    # accumulate total AMSE across clients according to assignment
     for client in clients:
-        best_cost = float('inf')
-        best_amse = float('inf')
-        best_server = None
-
-        for server in servers:
-            if latency_map is not None:
-                latency = float(latency_map.get(client, {}).get(server, client.get_latency_to(server)))
-            else:
-                latency = client.get_latency_to(server)
-
-            all_latencies.append(latency)
-            raw_amse = server_amse[server]
-            score_amse = server_amse_transformed[server]
-
-            load_factor = 1.0 + 0.3 * getattr(client, 'load', 0.0)
-            # quick heuristic selection before normalization uses transformed score
-            compound = (latency, score_amse, load_factor)
-
-            if compound[0] + compound[1] * 0.1 < best_cost:
-                best_cost = compound[0] + compound[1] * 0.1
-                best_amse = raw_amse
-                best_server = server
-
-        total_amse += best_amse
+        best_server = client_to_server.get(client)
+        if best_server is not None:
+            total_amse += server_amse.get(best_server, 0.0)
     
     # Normalize and compute final utility
-    latency_scale = max(max(all_latencies) if all_latencies else 1.0, 1e-6)
-    amse_scale = max(max(all_server_amses) if all_server_amses else 1.0, 1e-12)
+    latency_scale = max(float(latency_scale) if latency_scale is not None else (max(all_latencies) if all_latencies else 1.0), 1e-6)
+    amse_scale = max(float(amse_scale) if amse_scale is not None else (max(all_server_amses) if all_server_amses else 1.0), 1e-12)
     
     
     total_utility = 0.0
@@ -137,7 +138,7 @@ def compute_utility(servers, clients, alpha, beta, delta_list, snr_map=None, lat
                 latency = client.get_latency_to(server)
 
             raw_amse = server_amse[server]
-            score_amse = server_amse_transformed[server]
+            score_amse = server_amse_cost[server]
             normalized_latency = latency / latency_scale
             normalized_amse = score_amse / amse_scale
 
