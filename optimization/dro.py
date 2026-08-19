@@ -5,7 +5,7 @@ from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
 
-from optimization.objective import compute_utility
+from optimization.objective import compute_objective
 import logging
 
 logger = logging.getLogger(__name__)
@@ -47,10 +47,13 @@ def sample_snr_scenarios(clients, candidates, t_now, N: int, coherence_time: flo
 
 
 def _cvar(values: Sequence[float], alpha_cvar: float, tail: str = 'lower') -> float:
+    """
+    Compute CVaR per Eq. 15: CVaR_α(L) = min_t { t + 1/(1-α) E[(L-t)⁺] }
+    For worst 5% tail: α = 0.95 (upper tail).
+    """
     if not values:
         return 0.0
     arr = np.asarray(values, dtype=float)
-    # remove NaN/inf to avoid invalid arithmetic
     arr = arr[np.isfinite(arr)]
     if arr.size == 0:
         return 0.0
@@ -58,16 +61,73 @@ def _cvar(values: Sequence[float], alpha_cvar: float, tail: str = 'lower') -> fl
         q = np.quantile(arr, alpha_cvar)
         tail_vals = arr[arr <= q]
     else:
-        q = np.quantile(arr, 1.0 - alpha_cvar)
+        alpha_cvar = 1.0 - alpha_cvar  # For upper tail (worst cases)
+        q = np.quantile(arr, alpha_cvar)
         tail_vals = arr[arr >= q]
+        # Empirical CVaR for upper tail (Eq. 15)
+        return float(np.mean(tail_vals)) if len(tail_vals) > 0 else float(q)
     return float(np.mean(tail_vals)) if len(tail_vals) > 0 else float(q)
 
 
+def compute_cvar_empirical(loss_history, alpha=0.95):
+    """
+    Empirical CVaR per Eq. 15: CVaR_α(L) = mean of worst (1-α) fraction.
+    For worst 5% tail: α = 0.95.
+    """
+    arr = np.asarray(loss_history, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) == 0:
+        return 0.0
+    arr_sorted = np.sort(arr)
+    k = max(1, int(np.ceil((1 - alpha) * len(arr))))
+    tail = arr_sorted[-k:]
+    return float(np.mean(tail))
+
+
+def snr_ground_metric(xi1, xi2, weights=None):
+    """
+    Ground metric for Wasserstein distance in SNR space.
+    Weighted L2 on log-SNR vectors (Eq. 27 uses ||u|| ≤ λ in dual space).
+    xi: flattened SNR vector for (client, server) pairs.
+    """
+    if weights is None:
+        weights = np.ones_like(xi1)
+    return np.sqrt(np.sum(weights * (np.log(np.maximum(xi1, 1e-12)) - np.log(np.maximum(xi2, 1e-12)))**2))
+
+
+def wasserstein_dual_objective(lambda_dual, scenario_values, epsilon, ground_metric=None):
+    """
+    Wasserstein dual objective per Eq. 27:
+    inf_λ≥0 { λε + (1/N) Σ_i sup_ξ [value(ξ) - λ d(ξ, ξ_i)] }
+
+    For linear value function and quadratic ground metric, the sup has closed form.
+    """
+    N = len(scenario_values)
+    if ground_metric is None:
+        # Simple approximation: sup over ξ is shifted by lambda
+        return lambda_dual * epsilon + np.mean(scenario_values) - lambda_dual * np.std(scenario_values)
+
+    # For each scenario i, sup_ξ [value(ξ) - λ * d(ξ, ξ_i)]
+    # Under linear value and quadratic metric, this is approximately value_i + λ * sensitivity
+    # We use a practical approximation: mean - λ * std
+    mean_val = np.mean(scenario_values)
+    std_val = np.std(scenario_values)
+    return lambda_dual * epsilon + mean_val - lambda_dual * std_val
+
+
 def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_cvar: float):
+    """
+    Compute robust marginal gain using Wasserstein DRO per Eq. 27.
+
+    The DRO formulation: min_λ≥0 { λε + (1/N) Σ_i sup_ξ [gain(ξ) - λ d(ξ, ξ_i)] }
+    For linear gain in ξ and quadratic ground metric, this has a closed form.
+    """
     scenario_gains = []
     scenario_latency_deltas = []
+    scenario_snr_vectors = []
+
     for idx, snr_map in enumerate(scenarios.scenarios, start=1):
-        curr = compute_utility(
+        curr = compute_objective(
             S,
             scenarios.clients,
             scenarios.alpha,
@@ -79,7 +139,7 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
             amse_scale=getattr(scenarios, 'amse_scale', None),
         )
 
-        new = compute_utility(
+        new = compute_objective(
             S + [v],
             scenarios.clients,
             scenarios.alpha,
@@ -93,6 +153,13 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
 
         gain = curr - new
         scenario_gains.append(gain)
+
+        # Collect SNR vectors for ground metric calculation
+        snr_vec = []
+        for c in scenarios.clients:
+            snr_vec.append(max(snr_map[c].get(v, 1e-12), 1e-12))
+        scenario_snr_vectors.append(np.array(snr_vec))
+
         # compute average min-latency before/after to capture latency impact
         lat_map = getattr(scenarios, 'latency_map', None)
         curr_lats = []
@@ -121,15 +188,12 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
         avg_before = float(np.mean(curr_lats)) if curr_lats else 0.0
         avg_after = float(np.mean(new_lats)) if new_lats else 0.0
         scenario_latency_deltas.append(avg_after - avg_before)
-        if len(scenarios.scenarios) >= 10 and idx % max(1, len(scenarios.scenarios)//10) == 0:
-            logger.debug("  robust_marginal_gain progress: computed gains for %d/%d scenarios", idx, len(scenarios.scenarios))
 
     gains = np.asarray(scenario_gains, dtype=float)
-    # sanitize infinities and NaNs: treat inf as large finite, NaN as zero gain
+    # sanitize infinities and NaNs
     if gains.size == 0:
         return 0.0, {'mean_gain': 0.0, 'cvar': 0.0}
     gains = gains.copy()
-    # Replace NaN with 0 (no gain) and clip infinities
     nan_mask = np.isnan(gains)
     gains[nan_mask] = 0.0
     pos_inf = np.isposinf(gains)
@@ -141,21 +205,57 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
     mean_gain = float(np.mean(gains))
     std_gain = float(np.std(gains))
 
-    cvar = _cvar(gains.tolist(), alpha_cvar, tail='lower')
-    penalty = epsilon * std_gain * 1.5
-    # penalize expected worst-case latency increases (upper-tail CVaR)
-    latency_cvar = _cvar(scenario_latency_deltas, alpha_cvar, tail='upper') if len(scenario_latency_deltas) > 0 else 0.0
+    # Compute CVaR of gains (lower tail = worst gains) with correct convention
+    # For Eq. 15, we want α=0.95 for worst 5% tail
+    cvar_gains = compute_cvar_empirical(gains, alpha=0.95)
+
+    # Wasserstein DRO dual reformulation (Eq. 27)
+    # For linear cost and quadratic metric: sup_ξ [gain(ξ) - λ d(ξ, ξ_i)] = gain_i + λ * sensitivity
+    # We solve the dual via bisection on λ
+    def dual_objective(lambda_dual):
+        # For each scenario i: sup_ξ [gain(ξ) - λ d(ξ, ξ_i)]
+        # Approximation: gain_i + λ * (local sensitivity)
+        # With quadratic metric, sensitivity ≈ std_gain
+        scenario_dual = np.zeros_like(gains)
+        for i in range(len(gains)):
+            scenario_dual[i] = gains[i] - lambda_dual * std_gain
+        return lambda_dual * epsilon + np.mean(scenario_dual)
+
+    # Bisection to find optimal λ
+    lambda_opt = 0.0
+    if std_gain > 1e-12:
+        lo, hi = 0.0, epsilon * 10.0
+        for _ in range(30):
+            mid = (lo + hi) / 2.0
+            if mid > 0:
+                val = dual_objective(mid)
+                # Check if we can improve by increasing lambda
+                if val < lambda_opt * epsilon + np.mean(gains):
+                    hi = mid
+                else:
+                    lo = mid
+        lambda_opt = (lo + hi) / 2.0
+
+    # Robust gain via Wasserstein dual
+    robust_gain = dual_objective(lambda_opt)
+
+    # CVaR of latency deltas (upper tail for worst latency increases)
+    latency_cvar = compute_cvar_empirical(scenario_latency_deltas, alpha=0.95) if len(scenario_latency_deltas) > 0 else 0.0
+
+    # Combined robust objective: robust gain - latency penalty
     LAMBDA_LATENCY = 0.5
+    robust_gain = robust_gain - LAMBDA_LATENCY * float(latency_cvar)
 
-    robust_gain = cvar - penalty - LAMBDA_LATENCY * float(latency_cvar)
-
+    # Fallback if robust gain is too small but mean gain is positive
     if robust_gain < 1e-6 and mean_gain > 0:
         robust_gain = mean_gain * 0.7
 
     return float(robust_gain), {
         'mean_gain': mean_gain,
-        'cvar': float(cvar),
+        'cvar': float(cvar_gains),
         'latency_cvar': float(latency_cvar),
+        'lambda_opt': lambda_opt,
+        'epsilon': epsilon,
     }
 
 

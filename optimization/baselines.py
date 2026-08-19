@@ -1,7 +1,7 @@
 import numpy as np
 from typing import Dict, List
 
-from optimization.objective import compute_amse_kn_from_snr, compute_utility
+from optimization.objective import compute_amse_kn_from_snr, compute_objective
 from optimization.placement import greedy_server_selection, dr_greedy_server_selection
 from simulation.topology.nodes import Node, NodeType
 
@@ -251,8 +251,9 @@ def hsfl_selection(
 def _hsfl_local_refine(selected, candidates, clients, budget, cost, t_now):
     """Iterative refinement inspired by paper's device association + resource allocation"""
     best_set = list(selected)
-    best_utility = compute_utility(best_set, clients, 0.5, 0.5, [0.1, 0.2])
-    
+    # compute_objective returns cost (lower is better)
+    best_cost = compute_objective(best_set, clients, 0.5, 0.5, [0.1, 0.2])
+
     for _ in range(4):  # limited iterations for efficiency
         improved = False
         for i, s in enumerate(best_set):
@@ -261,16 +262,16 @@ def _hsfl_local_refine(selected, candidates, clients, budget, cost, t_now):
                     continue
                 if cost.get(alt, 1.0) > cost.get(s, 1.0) * 1.5:  # avoid too expensive swaps
                     continue
-                    
+
                 trial = best_set[:i] + [alt] + best_set[i+1:]
                 trial_cost = sum(cost.get(x, 1.0) for x in trial)
                 if trial_cost > budget:
                     continue
-                    
-                util = compute_utility(trial, clients, 0.5, 0.5, [0.1, 0.2])
-                if util < best_utility:   # lower utility = better
+
+                util = compute_objective(trial, clients, 0.5, 0.5, [0.1, 0.2])
+                if util < best_cost:   # lower cost = better
                     best_set = trial
-                    best_utility = util
+                    best_cost = util
                     improved = True
                     break
             if improved:

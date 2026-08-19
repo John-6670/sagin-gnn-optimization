@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset, random_split
 from torch_geometric.data import HeteroData
 
-from optimization.objective import compute_utility
+from optimization.objective import compute_objective, compute_marginal_gain
 from simulation.topology.nodes import NodeType, generate_nodes
 
 
@@ -34,7 +34,7 @@ class SAGINSnapshotDataset(Dataset):
     def __getitem__(self, idx):
         if self.cache[idx] is not None:
             return self.cache[idx]
-        
+
         p = self.lhs[idx]
         clients_n = 125
         sats = 9
@@ -44,16 +44,21 @@ class SAGINSnapshotDataset(Dataset):
         clients = [n for n in nodes if n.type == NodeType.CLIENT]
         candidates = [n for n in nodes if n.type != NodeType.CLIENT]
 
-        # Build graph data (same as before)
+        # Build graph data
         data = HeteroData()
-        type_map = {NodeType.SATELLITE: 'satellite', NodeType.UAV: 'hap', 
+        type_map = {NodeType.SATELLITE: 'satellite', NodeType.UAV: 'hap',
                     NodeType.GROUND: 'ground', NodeType.CLIENT: 'client'}
         node_to_local = {}
         node_objects = {t: [] for t in type_map.values()}
 
+        # First pass: collect client list
         for n in nodes:
             tname = type_map[n.type]
             node_objects[tname].append(n)
+
+        # Second pass: build features with SNR statistics
+        for n in nodes:
+            tname = type_map[n.type]
             type_feat = {
                 NodeType.SATELLITE: [1,0,0,0],
                 NodeType.UAV: [0,1,0,0],
@@ -61,7 +66,40 @@ class SAGINSnapshotDataset(Dataset):
                 NodeType.CLIENT: [0,0,0,1],
             }[n.type]
 
-            feat = np.array([*n.position, n.power, n.noise_variance, *type_feat], dtype=np.float32)
+            # Paper Eq. 31: x_v^t = [pos_v^t, vel_v^t, SNR_v^t, load_v^t, tier_v]
+            # pos: 3D, vel: 3D, SNR: statistics (mean, max, min, std) = 4, load: 1, tier: 4 one-hot
+            # Total: 3 + 3 + 4 + 1 + 4 = 15 features
+
+            # Get velocity
+            velocity = n.get_velocity_at()
+
+            # Compute SNR statistics to all clients
+            if n.type != NodeType.CLIENT:
+                snr_values = []
+                for c in clients:
+                    snr = c.compute_snr_to(n)
+                    if np.isfinite(snr) and snr > 0:
+                        snr_values.append(snr)
+
+                if snr_values:
+                    snr_mean = float(np.mean(snr_values))
+                    snr_max = float(np.max(snr_values))
+                    snr_min = float(np.min(snr_values))
+                    snr_std = float(np.std(snr_values))
+                else:
+                    snr_mean = snr_max = snr_min = snr_std = 0.0
+            else:
+                # Clients: SNR stats not applicable
+                snr_mean = snr_max = snr_min = snr_std = 0.0
+
+            feat = np.array([
+                *n.position,                    # 3: position
+                *velocity,                       # 3: velocity
+                snr_mean, snr_max, snr_min, snr_std,  # 4: SNR statistics
+                n.load,                          # 1: load
+                *type_feat                       # 4: one-hot type
+            ], dtype=np.float32)
+
             node_to_local[n.id] = (tname, len(data[tname].x) if hasattr(data, tname) and data[tname].x else 0)
             if not hasattr(data, tname) or not data[tname].x:
                 data[tname].x = []
@@ -122,7 +160,7 @@ class SAGINSnapshotDataset(Dataset):
                 edge_attr_store[et],
                 dtype=torch.float32
             )
-            
+
         label_dict = getattr(self, "labels_cache", None)
 
         if label_dict is not None and idx in label_dict:
@@ -132,62 +170,66 @@ class SAGINSnapshotDataset(Dataset):
 
         self.cache[idx] = data
         return data
-    
+
     def precompute_labels(self):
-        print("[Dataset] Precomputing labels...")
-        
+        """
+        Precompute marginal gain labels for all candidates per paper Eq. 23.
+        Must be called before training. Use PrecomputedGraphDataset for
+        cached snapshots data.
+        """
+        from configs.default import load_config
+        config = load_config()
+
         self.labels_cache = {}
-        for idx in range(self.num_samples):            
+        alpha = config.get('algorithm', {}).get('alpha', 0.5)
+        beta = config.get('algorithm', {}).get('beta', 0.5)
+        delta_list = config.get('algorithm', {}).get('delta_list', [0.1, 0.05])
+
+        for idx in range(self.num_samples):
             print(f"[Dataset] processing sample {idx}/{self.num_samples}")
-            
+
             clients_n = 500
 
             nodes = generate_nodes(
-                num_sats=36, num_uavs=8, num_ground=20, 
-                num_clients=clients_n, 
-                area_size=self.area_size, 
+                num_sats=36, num_uavs=8, num_ground=20,
+                num_clients=clients_n,
+                area_size=self.area_size,
                 gradient_dim=self.gradient_dim
             )
-            
+
             clients = [n for n in nodes if n.type == NodeType.CLIENT]
             candidates = [n for n in nodes if n.type != NodeType.CLIENT]
-            
+
+            # Start with empty placement (U(∅)=0)
             selected = []
-            for tier in [NodeType.GROUND, NodeType.UAV, NodeType.SATELLITE]:
-                tier_nodes = [n for n in candidates if n.type == tier]
-                if tier_nodes:
-                    selected.append(tier_nodes[self.rng.integers(len(tier_nodes))])
 
-            base_utility = compute_utility(
-                selected, clients, alpha=0.65, beta=0.35, delta_list=[0.1, 0.05]
-            )
-
-            # Label generation per tier
+            # For ALL candidates, compute marginal gain: Cost(S) - Cost(S ∪ {v})
+            # Paper Eq. 23: positive = improvement = Cost without v - Cost with v
             placement_types = ['satellite', 'hap', 'ground']
             type_map = {
                     NodeType.SATELLITE: 'satellite',
                     NodeType.UAV: 'hap',
                     NodeType.GROUND: 'ground'
                 }
-            
+
+            # Precompute SNRs for this snapshot
+            snr_map = {c: {s: c.compute_snr_to(s) for s in candidates} for c in clients}
+
             label_dict = {}
             for t in placement_types:
                 tier_nodes = [n for n in candidates if type_map.get(n.type) == t]
                 labels = []
                 for candidate in tier_nodes:
-                    new_servers = list(selected)
-                    if candidate not in new_servers:
-                        new_servers.append(candidate)
-                    new_utility = compute_utility(new_servers, clients, alpha=0.65, beta=0.35, delta_list=[0.1, 0.05])
-                    marginal_gain = base_utility - new_utility
-                    labels.append(float(marginal_gain))
+                    # Marginal gain = Cost(∅) - Cost({v}) = -Cost({v}) since Cost(∅) = 0
+                    gain = compute_marginal_gain(selected, candidate, clients, alpha, beta, delta_list, snr_map=snr_map)
+                    labels.append(float(gain))
 
                 labels = np.asarray(labels, dtype=np.float32)
                 if len(labels) > 1:
                     labels = (labels - labels.mean()) / (labels.std() + 1e-6)
-                    
+
                 label_dict[t] = torch.tensor(labels, dtype=torch.float32)
-                
+
             self.labels_cache[idx] = label_dict
 
             if idx % 50 == 0:

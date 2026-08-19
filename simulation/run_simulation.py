@@ -489,79 +489,171 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
     log.info("=== FL Experiments DONE ===")
 
 
-def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours, 
+def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours,
                               time_step_seconds, outer_interval_minutes, target_snr, N,
                               candidates=None, budget=None, cost=None, thresh=None,
                               alpha=None, beta=None, delta_list=None):
     """Helper to run one DRO configuration simulation"""
+    return _run_bilevel_simulation(
+        initial_selected=selected,
+        clients=clients,
+        nodes=nodes,
+        tag=tag,
+        duration_hours=duration_hours,
+        time_step_seconds=time_step_seconds,
+        outer_interval_minutes=outer_interval_minutes,
+        target_snr=target_snr,
+        N=N,
+        candidates=candidates,
+        budget=budget,
+        cost=cost,
+        thresh=thresh,
+        placement_algo=dr_selection,
+        alpha=alpha,
+        beta=beta,
+        delta_list=delta_list,
+    )
+
+
+def _run_bilevel_simulation(
+    initial_selected, clients, nodes, tag, duration_hours,
+    time_step_seconds, outer_interval_minutes, target_snr, N,
+    candidates=None, budget=None, cost=None, thresh=None,
+    placement_algo=None, alpha=None, beta=None, delta_list=None,
+    inner_iterations=5, maml_lr=0.01
+):
+    """
+    Two-timescale bilevel simulation (Algorithm 3 from paper):
+
+    OUTER LOOP (slow timescale, period T_slow = outer_interval_minutes):
+    - Runs DRO placement to select server set S
+    - Called every outer_interval_minutes
+
+    INNER LOOP (fast timescale, period T_fast = time_step_seconds):
+    - Runs OTA adaptation for fixed S
+    - Called every time_step_seconds
+    - MAML meta-update at slow boundary
+
+    Args:
+        initial_selected: Initial server placement
+        clients: List of client nodes
+        nodes: All nodes (for channel updates)
+        tag: Result CSV tag
+        duration_hours: Total simulation duration
+        time_step_seconds: Fast timescale step (inner loop period)
+        outer_interval_minutes: Slow timescale step (outer loop period)
+        target_snr: Target SNR for power control
+        N: Number of DRO scenarios
+        candidates: Candidate servers
+        budget: Budget constraint
+        cost: Cost dictionary
+        thresh: SNR threshold
+        placement_algo: DRO placement algorithm function
+        alpha, beta, delta_list: Objective weights
+        inner_iterations: Number of inner OTA iterations per outer step
+        maml_lr: MAML learning rate
+    """
+    from optimization.placement import run_inner_ota_loop
+
     rows = []
     ts = load.timescale()
     start = ts.now()
     weather = TwoStateWeatherMarkov(dt_seconds=time_step_seconds)
-    
-    print(start, [s.id for s in selected])
 
-    total_steps = int((duration_hours*3600)//time_step_seconds)
+    selected = list(initial_selected)
+    log.info(f"[{tag}] Starting bilevel simulation: {len(selected)} initial servers, "
+             f"T_fast={time_step_seconds}s, T_slow={outer_interval_minutes}min")
+
+    total_steps = int((duration_hours * 3600) // time_step_seconds)
+    outer_steps = int((outer_interval_minutes * 60) / time_step_seconds)
+
     for step in range(total_steps):
-        t_now = start + (step*time_step_seconds)/86400.0
+        t_now = start + (step * time_step_seconds) / 86400.0
+
+        # === Generate traffic for this step ===
         traffic = generate_spatiotemporal_traffic(clients, t_now)
         for c in clients:
-            c.load = float(traffic.get(c.id,0.0))
-        
+            c.load = float(traffic.get(c.id, 0.0))
+
+        # === Update weather/channel conditions ===
         loss_db = weather.atmospheric_loss_db()
         weather.step()
         for n in nodes:
-            if hasattr(n,'channel_model'):
+            if hasattr(n, 'channel_model'):
                 n.channel_model.set_weather_loss_db(loss_db)
-        
+
+        # === OUTER LOOP: Re-run placement every T_slow (only for DRO-based algorithms) ===
+        if step == 0 or (step % outer_steps == 0):
+            log.info(f"[{tag}] Step {step}: Running OUTER loop (placement re-selection)")
+            old_selected = selected
+
+            # Only re-run placement for DRO/DR-Greedy algorithms that support scenario-based re-selection
+            is_dro_algo = 'dr_greedy' in tag.lower() or 'dro' in tag.lower() or 'dr_' in tag.lower()
+            if is_dro_algo and placement_algo is not None:
+                selected = placement_algo(
+                    candidates=candidates, clients=clients, budget=budget, cost=cost,
+                    thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list,
+                    N=N, t_now=t_now
+                )
+            else:
+                # For non-DRO algorithms, keep the initial placement but allow pruning
+                selected = old_selected
+
+            if len(old_selected) != len(selected) or any(s1.id != s2.id for s1, s2 in zip(old_selected, selected)):
+                log.info(f"[{tag}] Server re-selection at step {step}: "
+                         f"{len(old_selected)}→{len(selected)} servers changed")
+
+        # === INNER LOOP: Run OTA adaptation every T_fast (with multiple inner iterations) ===
         avg_traffic = float(np.mean([c.load for c in clients])) if clients else 0.5
         avg_mobility = float(np.mean([np.linalg.norm(s.get_velocity_at(t_now)) for s in selected])) if selected else 0.0
-        ota = predictive_ota_control(selected, clients, t_now, target_snr, traffic=avg_traffic, mobility=avg_mobility)
-        
+
+        # Run inner loop OTA adaptation (Algorithm 3 steps 1-3)
+        ota = run_inner_ota_loop(
+            selected_servers=selected,
+            clients=clients,
+            t_now=t_now,
+            target_snr=target_snr,
+            traffic=avg_traffic,
+            mobility=avg_mobility,
+            inner_iterations=inner_iterations,
+            maml_lr=maml_lr,
+            delta_list=delta_list
+        )
+
+        # === Compute metrics ===
         amse_vals = []
         for s in selected:
             snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
             amse_vals.append(compute_amse_n(snr_dic, sigma2=10, d=100))
-        
+
         lat = compute_e2e_latency(clients, selected, t_now)
         energy = compute_total_energy(clients, selected, ota, transmission_time=time_step_seconds, t_now=t_now)
         amse = float(np.mean(amse_vals)) if amse_vals else 0.0
+
+        # Rolling CVaR
         window_size = 30
-        # CVaR computed on past window only (exclude current step to avoid trending up with AMSE)
         losses = [r[2] for r in rows[-window_size:]]
         cvar5 = compute_cvar(losses, alpha=0.05) if losses else amse
         cvar10 = compute_cvar(losses, alpha=0.10) if losses else amse
         cvar1 = compute_cvar(losses, alpha=0.01) if losses else amse
+
         num_sat = sum(1 for s in selected if s.type.value == "sat")
         num_uav = sum(1 for s in selected if s.type.value == "uav")
         num_ground = sum(1 for s in selected if s.type.value == "ground")
         rows.append((step, lat, amse, energy, cvar5, cvar10, cvar1, num_sat, num_uav, num_ground))
-        
-        # Re-selection every outer interval
-        if (step * time_step_seconds) % (outer_interval_minutes * 60) == 0 and step > 0:
-            old_selected = selected
-            selected = dr_selection(
-                candidates=candidates,
-                clients=clients,
-                budget=budget,
-                cost=cost,
-                thresh=thresh,
-                alpha=alpha,
-                beta=beta,
-                delta_list=delta_list,
-                N=N,
-                t_now=t_now
-            )
-            print(t_now, [s.id for s in selected])
-            if len(old_selected) != len(selected):
-                log.info(f"Server re-selection at step {step}: {len(old_selected)} → {len(selected)} servers")
-    
+
+        if step % 10 == 0:
+            log.info(f"[{tag}] Step {step:3d} | Servers: {len(selected)} | "
+                    f"AMSE: {amse:.4e} | Energy: {energy:.2f} | "
+                    f"CVaR95: {cvar5:.4e} | Dev(S,U,G)=({num_sat},{num_uav},{num_ground})")
+
     csv_path = f"results/{tag}_metrics.csv"
-    with open(csv_path,'w') as f:
+    os.makedirs("results", exist_ok=True)
+    with open(csv_path, 'w') as f:
         f.write('step,latency,amse,energy,cvar95,cvar90,cvar99,num_sat,num_uav,num_ground\n')
         for r in rows:
             f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]},{r[6]},{r[7]},{r[8]},{r[9]}\n")
-    print(f"   Saved: {csv_path}")
+    log.info(f"[{tag}] Saved: {csv_path}")
 
 
 def run_full_sweep(
@@ -624,96 +716,35 @@ def run_full_sweep(
     else:
         for name, algo in algorithms.items():
             log.info("Running simulation for algorithm: %s", name)
-            rows = []
+
             t_now = start  # use start time for initial selection
             selected = algo(
                 candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
                 alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
             )
-            total_steps = int((duration_hours*3600)//time_step_seconds)
-            for step in range(total_steps):
-                t_now = start + (step*time_step_seconds)/86400.0
-                traffic = generate_spatiotemporal_traffic(clients, t_now)
-                for c in clients:
-                    c.load = float(traffic.get(c.id,0.0))
-                    
-                loss_db = weather.atmospheric_loss_db()
-                weather.step()
-                for n in nodes:
-                    if hasattr(n,'channel_model'):
-                        n.channel_model.set_weather_loss_db(loss_db)
-                    
-                avg_traffic = float(np.mean([c.load for c in clients])) if clients else 0.5
-                avg_mobility = float(np.mean([np.linalg.norm(s.get_velocity_at(t_now)) for s in selected])) if selected else 0.0
 
-                # Real-time pruning: drop servers with zero marginal SNR contribution.
-                # O(|selected| * |clients|) per step; keeps at least one server.
-                if len(selected) > 1:
-                    snr_rt = {c: {sv: c.compute_snr_to(sv, t_now) for sv in selected} for c in clients}
-                    pruned = []
-                    for s in selected:
-                        marginal = sum(
-                            max(0.0, snr_rt[c][s] - max(
-                                (snr_rt[c][s2] for s2 in selected if s2 is not s), default=0.0
-                            ))
-                            for c in clients
-                        )
-                        if marginal > thresh:
-                            pruned.append(s)
-                    if pruned:
-                        selected = pruned
-
-                ota = predictive_ota_control(selected, clients, t_now, target_snr, traffic=avg_traffic, mobility=avg_mobility)
-
-                amse_vals = []
-                for s in selected:
-                    snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
-                    amse_vals.append(compute_amse_n(snr_dic, sigma2=10, d=100))
-                    
-                lat = compute_e2e_latency(clients, selected, t_now)
-                energy = compute_total_energy(clients, selected, ota, transmission_time=time_step_seconds, t_now=t_now)
-                if step % 5 == 0 or step == 0:
-                    print(f"Step {step:3d} | Algo: {name if 'name' in locals() else 'DRO'} | "
-                        f"Servers: {len(selected)} | Energy: {energy:.4f}")
-                
-                amse = float(np.mean(amse_vals)) if amse_vals else 0.0
-                # Use rolling window of last 30 steps for CVaR (matches outer_interval_minutes)
-                window_size = 30
-                losses = [r[2] for r in rows[-window_size:]] + [amse]
-                cvar5 = compute_cvar(losses, alpha=0.05)
-                cvar10 = compute_cvar(losses, alpha=0.10)
-                cvar1 = compute_cvar(losses, alpha=0.01)
-                num_sat = sum(1 for s in selected if s.type.value == "sat")
-                num_uav = sum(1 for s in selected if s.type.value == "uav")
-                num_ground = sum(1 for s in selected if s.type.value == "ground")
-                rows.append((step, lat, amse, energy, cvar5, cvar10, cvar1, num_sat, num_uav, num_ground))
-                print('Step {}: lat={:.2f}s, amse={:.4f}, eng={:.2f}J, CVaR(95,90,99)=({:.4f},{:.4f},{:.4f}), Dev(S,U,G)=({},{},{})'.format(
-                    step, lat, amse, energy, cvar5, cvar10, cvar1, num_sat, num_uav, num_ground))
-                    
-                # Debug logging for energy anomalies
-                if step > 0 and step % 10 == 0:
-                    avg_power = energy / len(clients) if clients else 0
-                    log.debug(f"Step {step}: energy={energy:.2f}, avg_power_per_client={avg_power:.4f}, num_servers={len(selected)}, num_clients={len(clients)}")
-                    
-                if (step*time_step_seconds)%(outer_interval_minutes*60) == 0 and step > 0:
-                    old_selected = selected
-                    selected = algo(
-                        candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
-                        alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
-                    )
-                    if len(old_selected) != len(selected):
-                        log.info(f"Server re-selection at step {step}: {len(old_selected)} → {len(selected)} servers")
-            
-            print('--- Algorithm {} choosed following servers at last time step ---'.format(name))
-            for s in selected:
-                print(f"Server {s.id} ({s.type.value}) at position {s.position.tolist()}")
-            
-            tag = f"_{results_tag}" if results_tag else ""
-            csv_path = f"results/{name}{tag}_metrics.csv"
-            with open(csv_path,'w') as f:
-                f.write('step,latency,amse,energy,cvar95,cvar90,cvar99,num_sat,num_uav,num_ground\n')
-                for r in rows:
-                    f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]},{r[6]},{r[7]},{r[8]},{r[9]}\n")
+            # Run bilevel simulation for this algorithm
+            _run_bilevel_simulation(
+                initial_selected=selected,
+                clients=clients,
+                nodes=nodes,
+                tag=f"{name}{results_tag}",
+                duration_hours=duration_hours,
+                time_step_seconds=time_step_seconds,
+                outer_interval_minutes=outer_interval_minutes,
+                target_snr=target_snr,
+                N=N,
+                candidates=candidates,
+                budget=budget,
+                cost=cost,
+                thresh=thresh,
+                placement_algo=algo,
+                alpha=alpha,
+                beta=beta,
+                delta_list=delta_list,
+                inner_iterations=5,
+                maml_lr=0.01
+            )
 
 
 def main():
@@ -749,13 +780,13 @@ def main():
 
     # ====================== Algorithms Dictionary ======================
     algorithms = {
-        "lop": lop_selection,
-        "go": go_selection,
-        "nrs": nrs_selection,
-        "random": random_selection,
-        "da": da_selection,
-        "fedsn": fedsn_selection,
-        "hsfl": hsfl_selection,
+        # "lop": lop_selection,
+        # "go": go_selection,
+        # "nrs": nrs_selection,
+        # "random": random_selection,
+        # "da": da_selection,
+        # "fedsn": fedsn_selection,
+        # "hsfl": hsfl_selection,
         "dr_greedy": dr_selection,
     }
 

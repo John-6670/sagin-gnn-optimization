@@ -1,11 +1,11 @@
 import logging
 
 import numpy as np
-from typing import List, Dict
+from typing import List, Dict, Tuple, Callable
 
 from simulation.topology.nodes import Node, NodeType
-from optimization.objective import compute_utility
-from simulation.topology.aircomp import compute_amse_n
+from optimization.objective import compute_objective, compute_marginal_gain, compute_placement_utility
+from simulation.topology.aircomp import compute_amse_n, compute_amse_kn
 from optimization.dro import ScenarioBundle, sample_snr_scenarios, robust_marginal_gain, local_one_swap
 from optimization.meta_learner import MAMLInnerOptimizer
 from models.gnn.train import predict_candidate_scores
@@ -49,81 +49,182 @@ class KalmanTimingFilter:
 _MAML = MAMLInnerOptimizer()
 
 
-def predictive_ota_control(selected_servers: List[Node], clients: List[Node], t_now, 
-                          target_snr=10.0, traffic=0.5, mobility=0.5) -> Dict:
+def predictive_ota_control(selected_servers: List[Node], clients: List[Node], t_now,
+                          target_snr=10.0, traffic=0.5, mobility=0.5, delta_list=None) -> Dict:
     """
     Improved OTA power control that actually adapts to channel quality.
     """
-    ota_results = {}
+    return run_inner_ota_loop(
+        selected_servers=selected_servers,
+        clients=clients,
+        t_now=t_now,
+        target_snr=target_snr,
+        traffic=traffic,
+        mobility=mobility,
+        inner_iterations=5,
+        delta_list=delta_list
+    )
+
+
+def run_inner_ota_loop(
+    selected_servers: List[Node],
+    clients: List[Node],
+    t_now,
+    target_snr: float,
+    traffic: float = 0.5,
+    mobility: float = 0.5,
+    inner_iterations: int = 5,
+    beamformer_update_freq: int = 2,
+    maml_lr: float = 0.01,
+    delta_list=None
+) -> Dict:
+    """
+    Two-timescale inner loop (Algorithm 3): Runs OTA adaptation at fast timescale
+    given fixed placement S from outer loop.
+
+    Alpha steps:
+    1. Predictive sync via Kalman filter
+    2. Per-tier adaptive beamforming (MRT for UAV/ground, zeroforce for sat)
+    3. Power + pre-equalization phase control
+    4. MAML meta-update at boundary (every T_slow / T_fast steps)
+
+    Args:
+        selected_servers: Placement set S from outer loop (DRO)
+        clients: List of client nodes
+        t_now: Current simulation time
+        target_snr: Target SNR for power control
+        traffic: Traffic load proxy
+        mobility: Mobility proxy
+        inner_iterations: Number of fast-timescale iterations (T_fast)
+        beamformer_update_freq: Update beamformer every n iterations
+        maml_lr: MAML inner learning rate
+
+    Returns:
+        dict: OTA control parameters per server per client
+    """
     c = 3e8
+    ota_results = {}
     power_saturations = 0
 
-    for server in selected_servers:
-        control_params = {}
-        
-        # Get current channels and SNRs
-        hs, snrs = [], []
-        for client in clients:
-            h = client.get_channel(server, t_now)
-            snr_val = max(client.compute_snr_to(server, t_now), 1e-12)
-            hs.append(np.array([h], dtype=np.complex128))
-            snrs.append(snr_val)
+    # Initialize per-server RNG seed for reproducible sampling
+    server_seeds = {s.id: hash(s.id) % 2**32 for s in selected_servers}
 
-        # Simple MRT beamforming
-        R = np.zeros((1, 1), dtype=np.complex128)
-        for h, snr in zip(hs, snrs):
-            R += snr * np.outer(h, h.conj())
-        eigvals, eigvecs = np.linalg.eigh(R)
-        w_star = eigvecs[:, np.argmax(eigvals)]
+    for iter_idx in range(inner_iterations):
+        for server in selected_servers:
+            control_params = {}
 
-        # MAML adaptation
-        adapted, sync_adj, _ = _MAML.maml_update(snrs, traffic=traffic, mobility=mobility)
-        power_scale = float(1 / (1 + np.exp(-adapted[0].item())))   # 0~1
+            # === STEP 1: Predictive Sync via Kalman Filter ===
+            # Get current channels and SNRs
+            hs, snrs = [], []
+            for client in clients:
+                h = client.get_channel(server, t_now)
+                snr_val = max(client.compute_snr_to(server, t_now), 1e-12)
+                hs.append(np.array([h], dtype=np.complex128))
+                snrs.append(snr_val)
 
-        for idx, client in enumerate(clients):
-            pos_c = client.get_position_at(t_now)
-            pos_s = server.get_position_at(t_now)
-            d_hat = np.linalg.norm(pos_c - pos_s) * 1000.0
-            tau_base = d_hat / c
+            # MAML adaptation (runs at slow boundary, but called every iteration with small steps)
+            adapted, sync_adj, _ = _MAML.maml_update(
+                snrs, traffic=traffic, mobility=mobility, lr=maml_lr
+            )
+            power_scale = float(1 / (1 + np.exp(-adapted[0].item())))   # 0~1
 
-            kf = KalmanTimingFilter(dt=1.0)  # Note: better to reuse KF per server if possible
-            kf.predict()
-            tau_filtered = kf.update(tau_base)[0, 0]
-            tau_window = tau_base + tau_filtered + sync_adj
+            # === STEP 2: Per-tier Adaptive Beamforming ===
+            # Update beamformer periodically (not every iteration to reduce overhead)
+            if iter_idx % beamformer_update_freq == 0:
+                if server.type == NodeType.SATELLITE:
+                    # Satellite: zero-forcing beamforming to suppress inter-user interference
+                    # Stack all client channels
+                    H = np.vstack(hs)  # (num_clients, 1) - single antenna per client
+                    if len(H) > 1:
+                        # For single-antenna clients, MRT is optimal; ZF reduces to MRT
+                        R = np.zeros((1, 1), dtype=np.complex128)
+                        for h, snr in zip(hs, snrs):
+                            R += snr * np.outer(h, h.conj())
+                    else:
+                        R = snrs[0] * np.outer(hs[0], hs[0].conj())
+                else:
+                    # UAV/Ground: MRT beamforming (maximizes array gain)
+                    R = np.zeros((1, 1), dtype=np.complex128)
+                    for h, snr in zip(hs, snrs):
+                        R += snr * np.outer(h, h.conj())
 
-            channel_phase = np.angle(hs[idx][0])
-            pre_equalization_phase = -channel_phase + float(adapted[1].item()) + np.angle(w_star[0])
+                eigvals, eigvecs = np.linalg.eigh(R)
+                w_star = eigvecs[:, np.argmax(eigvals)]
+            else:
+                # Reuse previous beamformer if available
+                if iter_idx == 0:
+                    # First iteration: compute initial beamformer
+                    R = np.zeros((1, 1), dtype=np.complex128)
+                    for h, snr in zip(hs, snrs):
+                        R += snr * np.outer(h, h.conj())
+                    eigvals, eigvecs = np.linalg.eigh(R)
+                    w_star = eigvecs[:, np.argmax(eigvals)]
 
-            # === ENERGY-MINIMIZING POWER CALCULATION ===
-            # Target 80% of max achievable SNR — always feasible regardless of channel.
-            # MAML is trained to minimize power further while maintaining this fraction.
-            base_required_power = 0.8 * client.power
-            optimized_power = base_required_power * power_scale
+            # === STEP 3: Power Control + Pre-equalization Phase ===
+            for idx, client in enumerate(clients):
+                pos_c = client.get_position_at(t_now)
+                pos_s = server.get_position_at(t_now)
+                d_hat = np.linalg.norm(pos_c - pos_s) * 1000.0
+                tau_base = d_hat / c
 
-            # Clip — never exceed client.power, never go below noise floor
-            pre_clipped = optimized_power
-            optimized_power = float(np.clip(optimized_power, 1e-4, client.power))
+                # Kalman timing filter for predictive sync
+                kf = KalmanTimingFilter(dt=1.0)
+                kf.predict()
+                tau_filtered = kf.update(tau_base)[0, 0]
+                tau_window = tau_base + tau_filtered + sync_adj
 
-            if optimized_power >= client.power - 1e-6:
-                power_saturations += 1
+                # Pre-equalization phase: compensate channel + add MAML phase + beamformer phase
+                channel_phase = np.angle(hs[idx][0])
+                pre_equalization_phase = -channel_phase + float(adapted[1].item()) + np.angle(w_star[0])
 
-            control_params[client.id] = {
-                "power": optimized_power,
-                "phase": pre_equalization_phase,
-                "snr": snrs[idx],
-                "tau_window": float(tau_window),
-                "beamformer": w_star.copy(),
-                "requested_power": float(pre_clipped),
-                "max_power_clipped": optimized_power >= client.power - 1e-6,
-            }
+                # Energy-minimizing power calculation: achieve target fraction of max SNR
+                # MAML learns to minimize power while maintaining target_snr
+                max_possible_snr = snrs[idx]
+                base_required_power = min(client.power, target_snr * client.power / max(max_possible_snr, 1e-6))
+                optimized_power = base_required_power * power_scale
 
-        ota_results[server.id] = control_params
+                # Clip power: [noise_floor, max_client_power]
+                pre_clipped = optimized_power
+                optimized_power = float(np.clip(optimized_power, 1e-4, client.power))
+
+                if optimized_power >= client.power - 1e-6:
+                    power_saturations += 1
+
+                # Compute AMSE for this client-server pair as monitoring metric
+                if iter_idx == inner_iterations - 1:  # Only on last iteration
+                    amse_val = compute_amse_kn(client, server, delta_list, t_now)
+                else:
+                    amse_val = 0.0
+
+                control_params[client.id] = {
+                    "power": optimized_power,
+                    "phase": pre_equalization_phase,
+                    "snr": snrs[idx],
+                    "tau_window": float(tau_window),
+                    "beamformer": w_star.copy() if iter_idx == inner_iterations - 1 else None,
+                    "requested_power": float(pre_clipped),
+                    "max_power_clipped": optimized_power >= client.power - 1e-6,
+                    "amse_kn": float(amse_val),
+                    "iter": iter_idx,
+                }
+
+            ota_results[server.id] = control_params
 
     if power_saturations > 0:
         log.debug(
-            "predictive_ota_control: %d/%d client-server pairs saturated to max power",
-            power_saturations, len(clients) * len(selected_servers)
+            "run_inner_ota_loop: %d/%d client-server pairs saturated to max power (%d iters)",
+            power_saturations, len(clients) * len(selected_servers), inner_iterations
         )
+
+    # Final MAML meta-update at slow boundary (called once per outer step)
+    # Use SNRs from the last iteration of the last server
+    if selected_servers and clients:
+        last_snrs = []
+        last_server = selected_servers[-1]
+        for client in clients:
+            snr_val = max(client.compute_snr_to(last_server, t_now), 1e-12)
+            last_snrs.append(snr_val)
+        _MAML.maml_update(last_snrs, traffic=traffic, mobility=mobility, lr=maml_lr, meta_update=True)
 
     return ota_results
 
@@ -152,10 +253,10 @@ def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float]
             break
 
         best_server, best_gain = None, -float("inf")
-        current_utility = compute_utility(S, clients, alpha, beta, delta_list, snr_map=snr_map)
+        current_utility = compute_objective(S, clients, alpha, beta, delta_list, snr_map=snr_map)
 
         for server in candidates_cp:
-            new_utility = compute_utility(S + [server], clients, alpha, beta, delta_list, snr_map=snr_map)
+            new_utility = compute_objective(S + [server], clients, alpha, beta, delta_list, snr_map=snr_map)
             utility_gain = (current_utility - new_utility) / cost[server]
 
             # Energy proxy: fraction of clients whose SNR target this server satisfies.
@@ -238,20 +339,20 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
                 snr_dict = {c: max(snr_map[c].get(s, 1e-12), 1e-12) for c in clients}
                 amse_scale_values.append(compute_amse_n(snr_dict, sigma2, gradient_dim))
     amse_scale = max(_np.percentile(amse_scale_values, 95) if amse_scale_values else 1.0, 1e-12)
-    
+
     bundle = ScenarioBundle(scenarios=scenario_maps, clients=clients, candidates=C,
                             delta_list=delta_list, alpha=alpha, beta=beta,
                             latency_map=latency_map, latency_scale=latency_scale,
                             amse_scale=amse_scale)
     print(f"DR-Greedy: Starting robust selection with {len(C)} candidates and budget {budget}")
-    
-    S, total_cost, remaining = [], 0.0, list(C)   
+
+    S, total_cost, remaining = [], 0.0, list(C)
     while remaining:
         best_v, best_score = None, -float('inf')
         for v in remaining:
             if total_cost + cost[v] > budget:
                 continue
-            
+
             score, _ = robust_marginal_gain(S, v, bundle, epsilon=epsilon, alpha_cvar=alpha_cvar)
             if score > best_score:
                 best_score, best_v = score, v
@@ -268,13 +369,13 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
             bisect_lambda_for_amse_target(S, bundle, alpha_cvar, tau_amse)
 
     if not S:
-        empty_obj = compute_utility([], clients, alpha, beta, delta_list)
+        empty_obj = compute_objective([], clients, alpha, beta, delta_list)
         best_v = None
         best_val = float('inf')
         for v in C:
             if cost[v] > budget:
                 continue
-            value = compute_utility(
+            value = compute_objective(
                 [v], clients, alpha, beta, delta_list, latency_map=latency_map,
                 latency_scale=latency_scale, amse_scale=amse_scale,
             )

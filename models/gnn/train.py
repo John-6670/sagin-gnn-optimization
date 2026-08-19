@@ -33,9 +33,9 @@ def train_gnn(epochs=200, batch_size=32, lr=1e-3, checkpoint_path='checkpoints/s
     val_ds   = PrecomputedGraphDataset(path="precomputed_dataset", split="val")
     test_ds  = PrecomputedGraphDataset(path="precomputed_dataset", split="test")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               pin_memory=True, num_workers=4)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, 
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
                               pin_memory=True, num_workers=2)
 
     # Load one sample for metadata
@@ -91,11 +91,16 @@ def train_gnn(epochs=200, batch_size=32, lr=1e-3, checkpoint_path='checkpoints/s
                 lsub_part = torch.tensor(0.0, device=device)
                 lsnr_part = torch.tensor(0.0, device=device)
 
+                # Submodularity regularization: sample A⊂B pairs
+                # For now, use sequential approximation as proxy (batch order)
                 if min_len > 1:
                     lsub_part = submod_reg(pred[:min_len - 1], pred[1:min_len])
 
-                if batch[nt].x.size(1) > 2:
-                    snr_feature = batch[nt].x[:min_len, 2]
+                # SNR gradient penalty: use actual SNR feature (index 4: mean_snr after P0.3)
+                # Before P0.3: index 2 is noise_variance. After: SNR stats at indices 4-7
+                snr_feature_idx = 2  # Current noise_variance feature
+                if batch[nt].x.size(1) > snr_feature_idx:
+                    snr_feature = batch[nt].x[:min_len, snr_feature_idx]
                     if snr_feature.requires_grad:
                         lsnr_part = snr_penalty(pred[:min_len], snr_feature)
 
@@ -172,7 +177,7 @@ def train_gnn(epochs=200, batch_size=32, lr=1e-3, checkpoint_path='checkpoints/s
     # ====================== FINAL SAVE ======================
     Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), checkpoint_path)
-    
+
     meta_path = Path(checkpoint_path).with_suffix('.meta.pkl')
     with open(meta_path, 'wb') as f:
         pickle.dump({'metadata': sample.metadata(), 'in_dims': in_dims}, f)
@@ -225,24 +230,49 @@ def predict_candidate_scores(model, candidates, clients, selected_servers=None):
     for t in type_map.values():
         data[t].x = []
 
+    # Pre-compute SNR statistics for server nodes
     for n in list(candidates) + list(clients):
         tname = type_map[n.type]
+
+        if n.type != NodeType.CLIENT:
+            # Server nodes: compute SNR statistics to all clients
+            snr_values = []
+            for c in clients:
+                snr = c.compute_snr_to(n)
+                if np.isfinite(snr) and snr > 0:
+                    snr_values.append(snr)
+
+            if snr_values:
+                snr_mean = float(np.mean(snr_values))
+                snr_max = float(np.max(snr_values))
+                snr_min = float(np.min(snr_values))
+                snr_std = float(np.std(snr_values))
+            else:
+                snr_mean = snr_max = snr_min = snr_std = 0.0
+        else:
+            # Client nodes: SNR stats not applicable
+            snr_mean = snr_max = snr_min = snr_std = 0.0
+
+        # Paper Eq. 31: x_v^t = [pos_v^t, vel_v^t, SNR_v^t, load_v^t, tier_v]
+        velocity = n.get_velocity_at()
         feat = np.array([
-            *n.position,
-            n.power,
-            n.noise_variance,
+            *n.position,                    # 3: position
+            *velocity,                       # 3: velocity
+            snr_mean, snr_max, snr_min, snr_std,  # 4: SNR statistics
+            n.load,                          # 1: load
             float(n.type == NodeType.SATELLITE),
             float(n.type == NodeType.UAV),
             float(n.type == NodeType.GROUND),
             float(n.type == NodeType.CLIENT),
         ], dtype=np.float32)
+
         node_to_local[n.id] = (tname, len(data[tname].x))
         data[tname].x.append(feat)
 
     for t in type_map.values():
         rows = data[t].x
         data[t].x = (torch.tensor(np.array(rows), dtype=torch.float32)
-                     if rows else torch.zeros((0, 6), dtype=torch.float32))
+                     if rows else torch.zeros((0, 15), dtype=torch.float32))
 
     edge_store = {}
     for c in clients:
@@ -272,13 +302,13 @@ def predict_candidate_scores(model, candidates, clients, selected_servers=None):
         tname, idx = node_to_local[c.id]
         scores[c] = float(preds[tname][idx].item()) if (
             tname in preds and idx < preds[tname].size(0)) else 0.0
-        
+
     for c in candidates:
         if c.type == NodeType.SATELLITE:
             scores[c] *= 0.6      # downweight sats
         elif c.type == NodeType.UAV:
             scores[c] *= 0.85
-    
+
     return scores
 
 

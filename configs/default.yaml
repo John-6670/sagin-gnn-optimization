@@ -72,6 +72,13 @@ algorithm:
   - 0.05
   snr_threshold: 0.0
   target_snr: 1.0
+  # DRO parameters
+  epsilon_wasserstein: 0.15
+  tau_amse: 1.0
+  alpha_cvar: 0.95
+  coherence_time: 25.0
+  sigma_snr: 0.35
+  num_scenarios: 64
 
 
 gnn:

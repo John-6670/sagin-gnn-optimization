@@ -72,13 +72,37 @@ class SAGINHeteroGNN(nn.Module):
 
 
 class SubmodularityRegularizer(nn.Module):
-    def forward(self, gain_a, gain_b):
-        return F.relu(gain_b - gain_a).mean()
+    def forward(self, gains_a, gains_b):
+        """
+        Submodularity regularizer per Eq. 35.
+        For A subset B and v in B minus A: gain(A, v) >= gain(B, v)
+
+        Args:
+            gains_a: Marginal gains for smaller set A
+            gains_b: Marginal gains for larger set B (containing A)
+
+        Returns:
+            Mean violation: max(0, gain(B, v) - gain(A, v))
+        """
+        return F.relu(gains_b - gains_a).mean()
 
 
 class SNRGradientPenalty(nn.Module):
     def forward(self, preds, snr_feature):
+        """
+        SNR gradient penalty per Eq. 35.
+        Encourages negative correlation: d(pred)/d(SNR) < 0
+        (higher SNR -> less need for this server as relay)
+
+        Args:
+            preds: Model predictions for candidates
+            snr_feature: SNR feature values (not noise_variance)
+
+        Returns:
+            Mean squared gradient magnitude
+        """
         grads = torch.autograd.grad(preds.sum(), snr_feature, create_graph=True, retain_graph=True, allow_unused=True)[0]
         if grads is None:
             return torch.tensor(0.0, device=preds.device)
+        # Encourage negative gradient (higher SNR -> lower marginal gain)
         return (grads ** 2).mean()

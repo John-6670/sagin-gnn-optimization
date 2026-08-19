@@ -65,10 +65,28 @@ def compute_total_energy(clients, selected_servers, ota_params, transmission_tim
     return e
 
 
-def compute_cvar(loss_history, alpha=0.05):
+def compute_cvar(loss_history, alpha=0.95):
+    """
+    Compute CVaR (Conditional Value-at-Risk) per Eq. 15.
+
+    CVaR_α(L) = min_t { t + 1/(1-α) E[(L-t)⁺] }
+
+    For empirical data with confidence level α (e.g., 0.95 for worst 5% tail):
+    Sort ascending, take the upper (1-α) tail.
+
+    Args:
+        loss_history: Array of loss values
+        alpha: Confidence level (0.95 for worst 5% tail per paper Eq. 15)
+    """
     if len(loss_history) == 0:
         return 0.0
-    
-    arr = np.sort(np.asarray(loss_history, dtype=float))[::-1]
-    k = max(1,int(np.ceil(alpha*len(arr))))
-    return float(np.mean(arr[:k]))
+
+    arr = np.sort(np.asarray(loss_history, dtype=float))
+    arr = arr[np.isfinite(arr)]
+    if len(arr) == 0:
+        return 0.0
+
+    # For worst (1-α) fraction (upper tail)
+    k = max(1, int(np.ceil((1 - alpha) * len(arr))))
+    tail = arr[-k:]
+    return float(np.mean(tail))
