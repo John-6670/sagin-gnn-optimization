@@ -24,17 +24,29 @@ class ScenarioBundle:
     amse_scale: float = None
 
 
-def sample_snr_scenarios(clients, candidates, t_now, N: int, coherence_time: float, sigma_snr: float, dt_seconds: float = 10.0):
-    """Sample N SNR scenario maps with OU temporal perturbation per link."""
+def sample_snr_scenarios(clients, candidates, t_now, N: int, coherence_time: float, sigma_snr: float, dt_seconds: float = 10.0, use_orbital_avg: bool = False):
+    """Sample N SNR scenario maps with OU temporal perturbation per link.
+
+    If use_orbital_avg=True (for outer loop placement), satellite links use orbital-average SNR
+    per Eq. 21. Non-satellite links use instantaneous SNR.
+    """
+    from simulation.topology.nodes import NodeType
+    from optimization.objective import compute_orbital_avg_snr
+
     rho = np.exp(-dt_seconds / max(coherence_time, 1e-6))
     scenarios = []
-    logger.info("Sampling %d SNR scenarios (clients=%d, candidates=%d)", N, len(clients), len(candidates))
+    logger.info("Sampling %d SNR scenarios (clients=%d, candidates=%d, orbital_avg=%s)", N, len(clients), len(candidates), use_orbital_avg)
     for _ in range(N):
         snr_map = {}
         for c in clients:
             snr_map[c] = {}
             for s in candidates:
-                base = max(c.compute_snr_to(s, t_now), 1e-12)
+                if use_orbital_avg and s.type == NodeType.SATELLITE:
+                    # Use orbital-average SNR for satellite links (Eq. 21)
+                    base = compute_orbital_avg_snr(c, s, t_now)
+                else:
+                    # Instantaneous SNR for non-satellite or inner loop
+                    base = max(c.compute_snr_to(s, t_now), 1e-12)
                 noise = np.random.normal(0.0, sigma_snr)
                 log_snr = np.log(base)
                 perturbed_log = rho * log_snr + np.sqrt(max(0.0, 1.0 - rho * rho)) * noise

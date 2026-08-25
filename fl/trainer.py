@@ -37,7 +37,8 @@ CONVERGENCE_TRACKER = ConvergenceTracker()
 
 def FederatedRound(
     round_idx, clients, servers, ota_params, task, global_model,
-    client_loaders, test_loader, snr_map, delta_list, use_hybrid=True
+    client_loaders, test_loader, snr_map, delta_list, use_hybrid=True,
+    t_now=None
 ):
     p_t = 1.0
     active = list(range(len(clients)))
@@ -82,8 +83,22 @@ def FederatedRound(
         grads.append(grad_vec)
 
     log.debug("  Round %d: aggregating %d gradients (use_hybrid=%s)...", round_idx, len(grads), use_hybrid)
+
+    # Extract phase corrections from ota_params if available
+    phase_corrections = {}
+    if ota_params and isinstance(ota_params, dict):
+        # ota_params structure: {server_id: {client_id: {"phase": ...}}}
+        for server_params in ota_params.values():
+            if isinstance(server_params, dict):
+                for client_id, params in server_params.items():
+                    if isinstance(params, dict) and "phase" in params:
+                        phase_corrections[client_id] = params["phase"]
+
     if use_hybrid:
-        _, amse_round, meta = hybrid_patch([clients[i] for i in active], servers[0], snr_map, delta_list)
+        _, amse_round, meta = hybrid_patch(
+            [clients[i] for i in active], servers[0], snr_map, delta_list,
+            phase_corrections=phase_corrections, t_now=t_now
+        )
         w = np.array([meta['w_a'], meta['w_d']])
         base_gradient = np.mean(grads, axis=0)
 
@@ -98,7 +113,10 @@ def FederatedRound(
         log.debug("  Round %d: hybrid_patch amse=%.6f  w_a=%.4f  w_d=%.4f  w_sum=%.4f",
                   round_idx, amse_round, meta['w_a'], meta['w_d'], w.sum())
     else:
-        g, amse_round, _, _ = aircomp_aggregate([clients[i] for i in active], servers[0], snr_map, delta_list)
+        g, amse_round, _, _ = aircomp_aggregate(
+            [clients[i] for i in active], servers[0], snr_map, delta_list,
+            phase_corrections=phase_corrections, t_now=t_now
+        )
         log.debug("  Round %d: aircomp amse=%.6f", round_idx, amse_round)
 
     log.debug("  Round %d: applying global model update (grad norm=%.6f)...",

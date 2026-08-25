@@ -230,8 +230,18 @@ def run_inner_ota_loop(
 
 
 def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float], thresh, alpha, beta, delta_list, N,
-                            t_now=None, target_snr=1.0, energy_weight=0.3) -> List[Node]:
-    snr_map = {c: {s: c.compute_snr_to(s, t_now) for s in candidates} for c in clients}
+                            t_now=None, target_snr=1.0, energy_weight=0.3, use_hierarchical=True) -> List[Node]:
+    # Build SNR map - use orbital-average SNR for satellite links per Eq. 21
+    from optimization.objective import compute_orbital_avg_snr
+    from simulation.topology.nodes import NodeType
+
+    snr_map = {c: {} for c in clients}
+    for c in clients:
+        for s in candidates:
+            if s.type == NodeType.SATELLITE:
+                snr_map[c][s] = compute_orbital_avg_snr(c, s, t_now)
+            else:
+                snr_map[c][s] = max(c.compute_snr_to(s, t_now), 1e-12)
     best_snr = {c: 0.0 for c in clients}
     S, total_cost = [], 0
     candidates_cp = candidates.copy()
@@ -253,10 +263,11 @@ def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float]
             break
 
         best_server, best_gain = None, -float("inf")
-        current_utility = compute_objective(S, clients, alpha, beta, delta_list, snr_map=snr_map)
+        # Use hierarchical AMSE for objective computation
+        current_utility = compute_objective(S, clients, alpha, beta, delta_list, snr_map=snr_map, use_hierarchical=use_hierarchical, t_now=t_now)
 
         for server in candidates_cp:
-            new_utility = compute_objective(S + [server], clients, alpha, beta, delta_list, snr_map=snr_map)
+            new_utility = compute_objective(S + [server], clients, alpha, beta, delta_list, snr_map=snr_map, use_hierarchical=use_hierarchical, t_now=t_now)
             utility_gain = (current_utility - new_utility) / cost[server]
 
             # Energy proxy: fraction of clients whose SNR target this server satisfies.
@@ -321,8 +332,10 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
     # C = candidates.copy()
     for c in C:
         print(f"Candidate {c.id} | Type: {c.type} | Cost: {cost[c]:.2f}")
+    # Use orbital-average SNR for outer loop placement decisions (Eq. 21)
     scenario_maps = sample_snr_scenarios(clients, C, t_now, N=N,
-                                        coherence_time=coherence_time, sigma_snr=sigma_snr)
+                                        coherence_time=coherence_time, sigma_snr=sigma_snr,
+                                        use_orbital_avg=True)
     # Precompute latency map for this selection time to avoid repeated expensive calls
     print(f"DR-Greedy: Sampled {N} SNR scenarios for {len(clients)} clients and {len(C)} candidates")
     latency_map = {c: {s: c.get_latency_to(s, t_now) for s in C} for c in clients}
@@ -334,10 +347,12 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
     if clients:
         sigma2 = float(np.mean([c.noise_variance for c in clients]))
         gradient_dim = clients[0].gradient_dim
+        from simulation.topology.aircomp import compute_amse_hierarchical
+        tier_sync_errors = {1: 1e-9, 2: 5e-9, 3: 1e-8}
         for snr_map in scenario_maps:
-            for s in C:
-                snr_dict = {c: max(snr_map[c].get(s, 1e-12), 1e-12) for c in clients}
-                amse_scale_values.append(compute_amse_n(snr_dict, sigma2, gradient_dim))
+            # Use hierarchical AMSE for scaling
+            amse_val = compute_amse_hierarchical(C, clients, delta_list, t_now=t_now, tier_sync_errors=tier_sync_errors)
+            amse_scale_values.append(amse_val)
     amse_scale = max(_np.percentile(amse_scale_values, 95) if amse_scale_values else 1.0, 1e-12)
 
     bundle = ScenarioBundle(scenarios=scenario_maps, clients=clients, candidates=C,
@@ -369,7 +384,7 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
             bisect_lambda_for_amse_target(S, bundle, alpha_cvar, tau_amse)
 
     if not S:
-        empty_obj = compute_objective([], clients, alpha, beta, delta_list)
+        empty_obj = compute_objective([], clients, alpha, beta, delta_list, use_hierarchical=True, t_now=t_now)
         best_v = None
         best_val = float('inf')
         for v in C:
@@ -378,6 +393,7 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
             value = compute_objective(
                 [v], clients, alpha, beta, delta_list, latency_map=latency_map,
                 latency_scale=latency_scale, amse_scale=amse_scale,
+                use_hierarchical=True, t_now=t_now,
             )
             if value < best_val:
                 best_val = value

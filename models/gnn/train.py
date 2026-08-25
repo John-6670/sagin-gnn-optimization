@@ -222,6 +222,7 @@ def predict_candidate_scores(model, candidates, clients, selected_servers=None):
     import numpy as np
     from torch_geometric.data import HeteroData
     from simulation.topology.nodes import NodeType
+    from optimization.objective import compute_orbital_avg_snr
 
     type_map = {NodeType.SATELLITE: 'satellite', NodeType.UAV: 'hap',
                 NodeType.GROUND: 'ground', NodeType.CLIENT: 'client'}
@@ -236,9 +237,13 @@ def predict_candidate_scores(model, candidates, clients, selected_servers=None):
 
         if n.type != NodeType.CLIENT:
             # Server nodes: compute SNR statistics to all clients
+            # Use orbital-average SNR for satellite links per Eq. 21
             snr_values = []
             for c in clients:
-                snr = c.compute_snr_to(n)
+                if n.type == NodeType.SATELLITE:
+                    snr = compute_orbital_avg_snr(c, n, t0=None)  # Uses current time
+                else:
+                    snr = c.compute_snr_to(n)
                 if np.isfinite(snr) and snr > 0:
                     snr_values.append(snr)
 

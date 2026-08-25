@@ -207,6 +207,13 @@ def compute_ota_metrics(selected_servers, clients, target_snr, delta_list, sigma
         snr_dic = {}
         client_amse_values = []
 
+        # Extract phase corrections for this server from OTA results
+        phase_corrections = {}
+        server_ota = ota_results.get(n.id, {})
+        for client_id, params in server_ota.items():
+            if "phase" in params:
+                phase_corrections[client_id] = params["phase"]
+
         for k in clients:
             current_snr = k.compute_snr_to(n, t_now)
             optimized = ota_results.get(n.id, {}).get(k.id)
@@ -225,7 +232,9 @@ def compute_ota_metrics(selected_servers, clients, target_snr, delta_list, sigma
             client_amse_values.append(amse_kn_val)
 
         amse_n[n] = compute_amse_n(snr_dic, sigma2, gradient_dim)
-        _, hybrid_bound, _ = hybrid_patch(clients, n, {c: {n: snr_dic[c]} for c in clients}, delta_list, num_bits=8)
+        # Pass phase_corrections for coherent combining
+        _, hybrid_bound, _ = hybrid_patch(clients, n, {c: {n: snr_dic[c]} for c in clients},
+                                          delta_list, num_bits=8, phase_corrections=phase_corrections, t_now=t_now)
         amse_hybrid_n[n] = hybrid_bound
         if client_amse_values:
             amse_kn_avg[n] = np.mean(client_amse_values)
@@ -450,10 +459,11 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
             num_rounds = 12
 
             for r in range(num_rounds):
-                snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in clients}
+                t_now_r = t_now  # Use current outer loop time
+                snr_map = {c: {selected[0]: c.compute_snr_to(selected[0], t_now_r)} for c in clients}
                 res = FederatedRound(
                     r, clients, selected, {}, task, model, client_loaders,
-                    test_loader, snr_map, delta_list, use_hybrid=True
+                    test_loader, snr_map, delta_list, use_hybrid=True, t_now=t_now_r
                 )
                 amse_hist.append(res['amse'])
                 loss_hist.append(res['loss'])
@@ -780,13 +790,13 @@ def main():
 
     # ====================== Algorithms Dictionary ======================
     algorithms = {
-        # "lop": lop_selection,
-        # "go": go_selection,
-        # "nrs": nrs_selection,
-        # "random": random_selection,
-        # "da": da_selection,
-        # "fedsn": fedsn_selection,
-        # "hsfl": hsfl_selection,
+        "lop": lop_selection,
+        "go": go_selection,
+        "nrs": nrs_selection,
+        "random": random_selection,
+        "da": da_selection,
+        "fedsn": fedsn_selection,
+        "hsfl": hsfl_selection,
         "dr_greedy": dr_selection,
     }
 

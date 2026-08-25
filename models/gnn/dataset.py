@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset, random_split
 from torch_geometric.data import HeteroData
 
-from optimization.objective import compute_objective, compute_marginal_gain
+from optimization.objective import compute_objective, compute_marginal_gain, compute_orbital_avg_snr
 from simulation.topology.nodes import NodeType, generate_nodes
 
 
@@ -74,10 +74,14 @@ class SAGINSnapshotDataset(Dataset):
             velocity = n.get_velocity_at()
 
             # Compute SNR statistics to all clients
+            # Use orbital-average SNR for satellite links per Eq. 21
             if n.type != NodeType.CLIENT:
                 snr_values = []
                 for c in clients:
-                    snr = c.compute_snr_to(n)
+                    if n.type == NodeType.SATELLITE:
+                        snr = compute_orbital_avg_snr(c, n)
+                    else:
+                        snr = c.compute_snr_to(n)
                     if np.isfinite(snr) and snr > 0:
                         snr_values.append(snr)
 
@@ -120,7 +124,11 @@ class SAGINSnapshotDataset(Dataset):
         edge_attr_store = {}
         for c in clients:
             for s in candidates:
-                snr = c.compute_snr_to(s)
+                # Use orbital-average SNR for satellite links per Eq. 21
+                if s.type == NodeType.SATELLITE:
+                    snr = compute_orbital_avg_snr(c, s)
+                else:
+                    snr = c.compute_snr_to(s)
 
                 if (
                     not np.isfinite(snr)
@@ -213,7 +221,14 @@ class SAGINSnapshotDataset(Dataset):
                 }
 
             # Precompute SNRs for this snapshot
-            snr_map = {c: {s: c.compute_snr_to(s) for s in candidates} for c in clients}
+            # Use orbital-average SNR for satellite links per Eq. 21
+            snr_map = {c: {} for c in clients}
+            for c in clients:
+                for s in candidates:
+                    if s.type == NodeType.SATELLITE:
+                        snr_map[c][s] = compute_orbital_avg_snr(c, s)
+                    else:
+                        snr_map[c][s] = max(c.compute_snr_to(s), 1e-12)
 
             label_dict = {}
             for t in placement_types:
