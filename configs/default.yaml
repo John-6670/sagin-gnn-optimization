@@ -84,3 +84,41 @@ algorithm:
 gnn:
   checkpoint: checkpoints/sagin_hgnn.pt
   kappa: 0.3
+  # Training hyperparameters
+  epochs: 200
+  batch_size: 32
+  lr: 0.001
+  loss_weight_submod: 0.1
+  loss_weight_snr_grad: 0.05
+
+channel:
+  carrier_freq_hz: 2400000000.0  # 2.4 GHz
+  bandwidth_hz: 20000000.0       # 20 MHz
+  link_params:
+    leo_ground:
+      k_db: 10.0
+      coherence_time_s: 25.0
+    hap_ground:
+      k_db: 6.0
+      coherence_time_s: 10.0
+    ground_ground:
+      k_db: -inf
+      coherence_time_s: 2.0
+    leo_hap:
+      k_db: 8.0
+      coherence_time_s: 12.0
+
+weather:
+  atmospheric_loss_clear_db: 2.0
+  atmospheric_loss_rain_db: 4.0
+
+# Node distribution fractions
+node_distribution:
+  client:
+    stationary: 0.6
+    pedestrian: 0.2
+    vehicular: 0.2
+  ground_bs:
+    urban_macro: 0.6
+    urban_micro: 0.25
+    rural: 0.15

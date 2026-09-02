@@ -8,6 +8,10 @@ import pickle
 from torch.utils.data import Dataset
 
 from models.gnn.hgnn import SAGINHeteroGNN, SubmodularityRegularizer, SNRGradientPenalty
+from simulation.config_loader import load_config
+
+# Load config once at module level
+_config = load_config()
 
 
 class PrecomputedGraphDataset(Dataset):
@@ -24,7 +28,14 @@ class PrecomputedGraphDataset(Dataset):
         return torch.load(self.files[idx])
 
 
-def train_gnn(epochs=200, batch_size=32, lr=1e-3, checkpoint_path='checkpoints/sagin_hgnn.pt'):
+def train_gnn(epochs=None, batch_size=None, lr=None, checkpoint_path=None):
+    # Load GNN training parameters from config if not provided
+    gnn_cfg = _config.get('gnn', {})
+    epochs = epochs if epochs is not None else gnn_cfg.get('epochs', 200)
+    batch_size = batch_size if batch_size is not None else gnn_cfg.get('batch_size', 32)
+    lr = lr if lr is not None else gnn_cfg.get('lr', 1e-3)
+    checkpoint_path = checkpoint_path if checkpoint_path is not None else gnn_cfg.get('checkpoint', 'checkpoints/sagin_hgnn.pt')
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[GNN Training] Using device: {device} | CUDA available: {torch.cuda.is_available()}")
 
@@ -104,7 +115,7 @@ def train_gnn(epochs=200, batch_size=32, lr=1e-3, checkpoint_path='checkpoints/s
                     if snr_feature.requires_grad:
                         lsnr_part = snr_penalty(pred[:min_len], snr_feature)
 
-                loss += mse_part + 0.1 * lsub_part + 0.05 * lsnr_part
+                loss += mse_part + gnn_cfg.get('loss_weight_submod', 0.1) * lsub_part + gnn_cfg.get('loss_weight_snr_grad', 0.05) * lsnr_part
 
             loss = loss / accumulation_steps
             loss.backward()

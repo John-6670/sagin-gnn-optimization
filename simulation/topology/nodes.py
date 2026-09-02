@@ -5,8 +5,12 @@ from typing import List, Optional, Tuple
 
 from simulation.network.channel_model import SaginChannelModel
 from simulation.topology.constellation import WalkerConstellation
+from simulation.config_loader import load_config
 
 TS = load.timescale()
+
+# Load config once at module level
+_config = load_config()
 
 
 class NodeType(Enum):
@@ -28,16 +32,25 @@ class ClientMobilityType(Enum):
     VEHICULAR  = "vehicular"    # road-constrained       – 15 m/s
 
 
-# Ground BS physical parameters
+# Ground BS physical parameters from config
 BS_CFG: dict = {
     GroundBSType.URBAN_MACRO: dict(
-        isd_m=200, height_km=0.025, antenna_gain_dbi=17, power_w=40.0
+        isd_m=_config['nodes']['ground']['urban_macro']['isd_m'],
+        height_km=_config['nodes']['ground']['urban_macro']['height_m'] / 1000.0,
+        antenna_gain_dbi=_config['nodes']['ground']['urban_macro']['antenna_gain_dbi'],
+        power_w=_config['nodes']['ground']['urban_macro']['power_w']
     ),
     GroundBSType.URBAN_MICRO: dict(
-        isd_m=50,  height_km=0.010, antenna_gain_dbi=5,  power_w=10.0
+        isd_m=_config['nodes']['ground']['urban_micro']['isd_m'],
+        height_km=_config['nodes']['ground']['urban_micro']['height_m'] / 1000.0,
+        antenna_gain_dbi=_config['nodes']['ground']['urban_micro']['antenna_gain_dbi'],
+        power_w=_config['nodes']['ground']['urban_micro']['power_w']
     ),
     GroundBSType.RURAL: dict(
-        isd_m=1732, height_km=0.035, antenna_gain_dbi=17, power_w=40.0
+        isd_m=_config['nodes']['ground']['rural']['isd_m'],
+        height_km=_config['nodes']['ground']['rural']['height_m'] / 1000.0,
+        antenna_gain_dbi=_config['nodes']['ground']['rural']['antenna_gain_dbi'],
+        power_w=_config['nodes']['ground']['rural']['power_w']
     ),
 }
 
@@ -48,12 +61,12 @@ MOB_CFG: dict = {
     ClientMobilityType.VEHICULAR:  dict(speed_mps=15.0),   # road-aligned
 }
 
-# HAP station-keeping constraint (±2 km from home)
-HAP_BOX_KM: float = 2.0
+# HAP station-keeping constraint from config
+HAP_BOX_KM: float = _config['nodes']['uav']['station_keeping_km']
 
-# Coverage radii (informational; upper layers may use these for link selection)
-SAT_COVERAGE_KM: float  = 1100.0   # 10° min-elevation mask @ 550 km altitude
-HAP_COVERAGE_KM: float  = 100.0    # 20 km altitude
+# Coverage radii from config
+SAT_COVERAGE_KM: float = _config['nodes']['satellite']['coverage_radius_km']
+HAP_COVERAGE_KM: float = _config['nodes']['uav']['coverage_radius_km']
 
 # Thermal noise: kTB at 290 K, 20 MHz ≈ 8×10⁻¹⁴ W → round to 1×10⁻¹³ W
 THERMAL_NOISE_W: float  = 1e-13
@@ -280,15 +293,16 @@ def generate_nodes(
         return lat, lon
 
     # ── 1. Satellites
-    # Walker configuration: num_planes × 6 sats/plane ≈ num_sats
-    #   e.g. 9 sats → 3 planes × 3 = 9
+    # Walker configuration from config
+    sat_cfg = _config['nodes']['satellite']
     tle_list: list = []
     if num_sats > 0:
-        n_planes       = max(1, num_sats // 3)
-        sats_per_plane = max(1, num_sats // n_planes)
+        n_planes       = sat_cfg['num_planes']
+        sats_per_plane = sat_cfg['sats_per_plane']
         walker = WalkerConstellation(
             num_planes=n_planes, sats_per_plane=sats_per_plane,
-            phasing=1, inclination=53.0, altitude_km=550.0,
+            phasing=1, inclination=sat_cfg['inclination_deg'],
+            altitude_km=sat_cfg['altitude_km'],
         )
         tle_list = walker.generate_tle_list(t0)
 
@@ -296,26 +310,29 @@ def generate_nodes(
         tle      = tle_list[i] if i < len(tle_list) else None
         lat, lon = rand_ll(urban=False)
         nodes.append(Node(
-            i, NodeType.SATELLITE, [lat, lon, 550.0],
-            power=500.0, noise_variance=THERMAL_NOISE_W,
+            i, NodeType.SATELLITE, [lat, lon, sat_cfg['altitude_km']],
+            power=sat_cfg['power_w'], noise_variance=THERMAL_NOISE_W,
             gradient_dim=gradient_dim, tle=tle,
         ))
 
     # ── 2. HAPs (UAVs)
-    # Placed in a hexagonal ring at 60 km spacing; altitude fixed at 20 km.
+    # Placed in a hexagonal ring; altitude from config
+    uav_cfg = _config['nodes']['uav']
     hap_positions = _hexagonal_hap_positions(num_uavs, radius_km=60.0)
     for j, (lat, lon) in enumerate(hap_positions):
         idx      = num_sats + j
-        home_pos = [lat, lon, 20.0]
+        home_pos = [lat, lon, uav_cfg['altitude_km']]
         nodes.append(Node(
             idx, NodeType.UAV, home_pos[:],
-            power=10.0, noise_variance=THERMAL_NOISE_W,
+            power=uav_cfg['power_w'], noise_variance=THERMAL_NOISE_W,
             gradient_dim=gradient_dim, hap_home=home_pos,
         ))
 
     # ── 3. Ground BSs
-    n_macro = round(num_ground * 0.60)
-    n_micro = round(num_ground * 0.25)
+    # Distribution from config
+    bs_dist = _config.get('node_distribution', {}).get('ground_bs', {})
+    n_macro = round(num_ground * bs_dist.get('urban_macro', 0.60))
+    n_micro = round(num_ground * bs_dist.get('urban_micro', 0.25))
     n_rural = num_ground - n_macro - n_micro
 
     bs_plan: List[Tuple[GroundBSType, int, bool]] = [
@@ -338,13 +355,17 @@ def generate_nodes(
             bs_idx += 1
 
     # ── 4. Clients
-    n_stat = round(num_clients * 0.60)
-    n_ped  = round(num_clients * 0.20)
+    # Distribution from config
+    client_cfg = _config['nodes']['client']
+    client_dist = _config.get('node_distribution', {}).get('client', {})
+    n_stat = round(num_clients * client_dist.get('stationary', 0.60))
+    n_ped  = round(num_clients * client_dist.get('pedestrian', 0.20))
     n_veh  = num_clients - n_stat - n_ped
 
     def client_specs(mob_type: ClientMobilityType, count: int):
         """Build list of (mobility_type, is_urban) tuples."""
-        n_urban = round(count * 0.70)
+        urban_frac = client_cfg.get('urban_fraction', 0.70)
+        n_urban = round(count * urban_frac)
         return (
             [(mob_type, True)]  * n_urban +
             [(mob_type, False)] * (count - n_urban)

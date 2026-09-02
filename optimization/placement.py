@@ -9,8 +9,12 @@ from simulation.topology.aircomp import compute_amse_n, compute_amse_kn
 from optimization.dro import ScenarioBundle, sample_snr_scenarios, robust_marginal_gain, local_one_swap
 from optimization.meta_learner import MAMLInnerOptimizer
 from models.gnn.train import predict_candidate_scores
+from simulation.config_loader import load_config
 
 log = logging.getLogger(__name__)
+
+# Load config once at module level
+_config = load_config()
 
 
 def _get_tier_budgets(budget, num_sats=36, num_uavs=8, num_ground=20):
@@ -324,8 +328,18 @@ def _gnn_prune_candidates(candidates, clients, kappa=0.3, checkpoint=None):
 
 
 def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, t_now=None,
-                                epsilon=0.15, alpha_cvar=0.10, N=64, coherence_time=25.0, sigma_snr=0.35,
-                                gnn_checkpoint=None, kappa=0.3, tau_amse=None):
+                                epsilon=None, alpha_cvar=None, N=None, coherence_time=None, sigma_snr=None,
+                                gnn_checkpoint=None, kappa=None, tau_amse=None):
+    # Load DRO parameters from config if not provided
+    algo_cfg = _config.get('algorithm', {})
+    gnn_cfg = _config.get('gnn', {})
+
+    epsilon = epsilon if epsilon is not None else algo_cfg.get('epsilon_wasserstein', 0.15)
+    alpha_cvar = alpha_cvar if alpha_cvar is not None else algo_cfg.get('alpha_cvar', 0.95)
+    N = N if N is not None else algo_cfg.get('num_scenarios', 64)
+    coherence_time = coherence_time if coherence_time is not None else algo_cfg.get('coherence_time', 25.0)
+    sigma_snr = sigma_snr if sigma_snr is not None else algo_cfg.get('sigma_snr', 0.35)
+    kappa = kappa if kappa is not None else gnn_cfg.get('kappa', 0.3)
     from optimization.dro import bisect_lambda_for_amse_target
     # Increase kappa from 0.15 to 0.30 to match greedy's pruning level (30% instead of 15%)
     C = _gnn_prune_candidates(candidates, clients, kappa=kappa, checkpoint=gnn_checkpoint)

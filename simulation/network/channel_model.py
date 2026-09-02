@@ -6,9 +6,14 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from simulation.config_loader import load_config
+
 
 C_MPS = 299_792_458.0
 EARTH_ROT_RATE_RAD_S = 7.2921159e-5
+
+# Load config once at module level
+_config = load_config()
 
 
 class LinkType(Enum):
@@ -27,15 +32,31 @@ class LinkParams:
 class SaginChannelModel:
     """Realistic SAGIN channel model with pathloss, fading, Doppler, and temporal correlation."""
 
-    def __init__(self, carrier_freq_hz: float = 2.4e9, bandwidth_hz: float = 20e6, seed: int | None = None):
-        self.fc = carrier_freq_hz
-        self.bandwidth_hz = bandwidth_hz
+    def __init__(self, carrier_freq_hz: float = None, bandwidth_hz: float = None, seed: int | None = None):
+        ch_cfg = _config.get('channel', {})
+        self.fc = carrier_freq_hz or ch_cfg.get('carrier_freq_hz', 2.4e9)
+        self.bandwidth_hz = bandwidth_hz or ch_cfg.get('bandwidth_hz', 20e6)
         self.rng = np.random.default_rng(seed)
+
+        # Load link parameters from config
+        link_params_cfg = ch_cfg.get('link_params', {})
         self.link_params: Dict[LinkType, LinkParams] = {
-            LinkType.LEO_GROUND: LinkParams(k_db=10.0, coherence_time_s=25.0),
-            LinkType.HAP_GROUND: LinkParams(k_db=6.0, coherence_time_s=10.0),
-            LinkType.GROUND_GROUND: LinkParams(k_db=-np.inf, coherence_time_s=2.0),
-            LinkType.LEO_HAP: LinkParams(k_db=8.0, coherence_time_s=12.0),
+            LinkType.LEO_GROUND: LinkParams(
+                k_db=link_params_cfg.get('leo_ground', {}).get('k_db', 10.0),
+                coherence_time_s=link_params_cfg.get('leo_ground', {}).get('coherence_time_s', 25.0)
+            ),
+            LinkType.HAP_GROUND: LinkParams(
+                k_db=link_params_cfg.get('hap_ground', {}).get('k_db', 6.0),
+                coherence_time_s=link_params_cfg.get('hap_ground', {}).get('coherence_time_s', 10.0)
+            ),
+            LinkType.GROUND_GROUND: LinkParams(
+                k_db=link_params_cfg.get('ground_ground', {}).get('k_db', -np.inf),
+                coherence_time_s=link_params_cfg.get('ground_ground', {}).get('coherence_time_s', 2.0)
+            ),
+            LinkType.LEO_HAP: LinkParams(
+                k_db=link_params_cfg.get('leo_hap', {}).get('k_db', 8.0),
+                coherence_time_s=link_params_cfg.get('leo_hap', {}).get('coherence_time_s', 12.0)
+            ),
         }
         self._weather_state = "clear"
         self._weather_loss_db_override: float | None = None
