@@ -369,6 +369,10 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
                 continue
 
             score, _ = robust_marginal_gain(S, v, bundle, epsilon=epsilon, alpha_cvar=alpha_cvar)
+            # Normalize by cost: a 10-cost satellite must deliver 10x the robust
+            # gain of a 1-cost ground node to be worth half the budget. Without
+            # this, DR over-buys expensive satellites on raw (absolute) gain.
+            score = score / max(cost[v], 1e-9)
             if score > best_score:
                 best_score, best_v = score, v
         # Stop only when no feasible server exists or gain is genuinely negative

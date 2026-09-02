@@ -322,13 +322,17 @@ def local_one_swap(S, candidates, budget, cost, scenarios: ScenarioBundle, epsil
         for s in list(S):
             base_set = [x for x in S if x != s]
             base_cost = sum(cost[x] for x in base_set)
-            old_score = robust_marginal_gain(base_set, s, scenarios, epsilon, alpha_cvar)[0]
+            old_raw = robust_marginal_gain(base_set, s, scenarios, epsilon, alpha_cvar)[0]
+            # Cost-normalize: compare gain-per-unit-budget so a pricey satellite
+            # can be swapped out for cheaper nodes that deliver more gain/cost.
+            old_score = old_raw / max(cost[s], 1e-9)
             for v in candidates:
                 if v in S:
                     continue
                 if base_cost + cost[v] > budget:
                     continue
-                new_score = robust_marginal_gain(base_set, v, scenarios, epsilon, alpha_cvar)[0]
+                new_raw = robust_marginal_gain(base_set, v, scenarios, epsilon, alpha_cvar)[0]
+                new_score = new_raw / max(cost[v], 1e-9)
                 improvement = new_score - old_score
                 if improvement > best_improvement:
                     best_swap = (s, v, old_score, new_score, improvement)
