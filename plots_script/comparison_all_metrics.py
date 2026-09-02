@@ -30,6 +30,7 @@ def parse_algo_and_run(base_name: str):
 
     This is robust to algo names containing underscores (e.g., dr_greedy).
     """
+    base_name = base_name[:-1]
     for algo in sorted(KNOWN_ALGOS, key=len, reverse=True):
         if base_name == algo:
             return algo, 'run0'

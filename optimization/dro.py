@@ -22,6 +22,8 @@ class ScenarioBundle:
     latency_map: Dict = None
     latency_scale: float = None
     amse_scale: float = None
+    t_now: object = None
+    use_hierarchical: bool = True
 
 
 def sample_snr_scenarios(clients, candidates, t_now, N: int, coherence_time: float, sigma_snr: float, dt_seconds: float = 10.0, use_orbital_avg: bool = False):
@@ -149,6 +151,8 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
             latency_map=getattr(scenarios, 'latency_map', None),
             latency_scale=getattr(scenarios, 'latency_scale', None),
             amse_scale=getattr(scenarios, 'amse_scale', None),
+            t_now=getattr(scenarios, 't_now', None),
+            use_hierarchical=getattr(scenarios, 'use_hierarchical', True),
         )
 
         new = compute_objective(
@@ -161,6 +165,8 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
             latency_map=getattr(scenarios, 'latency_map', None),
             latency_scale=getattr(scenarios, 'latency_scale', None),
             amse_scale=getattr(scenarios, 'amse_scale', None),
+            t_now=getattr(scenarios, 't_now', None),
+            use_hierarchical=getattr(scenarios, 'use_hierarchical', True),
         )
 
         gain = curr - new
@@ -174,13 +180,14 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
 
         # compute average min-latency before/after to capture latency impact
         lat_map = getattr(scenarios, 'latency_map', None)
+        t_now = getattr(scenarios, 't_now', None)
         curr_lats = []
         new_lats = []
         for c in scenarios.clients:
             # current config
             if S:
                 lat_before = min([
-                    float(lat_map.get(c, {}).get(s, c.get_latency_to(s))) if lat_map is not None else float(c.get_latency_to(s))
+                    float(lat_map.get(c, {}).get(s, c.get_latency_to(s, t_now))) if lat_map is not None else float(c.get_latency_to(s, t_now))
                     for s in S
                 ])
             else:
@@ -189,7 +196,7 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
             # new config
             lat_candidates = S + [v]
             lat_after = min([
-                float(lat_map.get(c, {}).get(s, c.get_latency_to(s))) if lat_map is not None else float(c.get_latency_to(s))
+                float(lat_map.get(c, {}).get(s, c.get_latency_to(s, t_now))) if lat_map is not None else float(c.get_latency_to(s, t_now))
                 for s in lat_candidates
             ])
 
@@ -221,42 +228,65 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
     # For Eq. 15, we want α=0.95 for worst 5% tail
     cvar_gains = compute_cvar_empirical(gains, alpha=0.95)
 
-    # Wasserstein DRO dual reformulation (Eq. 27)
-    # For linear cost and quadratic metric: sup_ξ [gain(ξ) - λ d(ξ, ξ_i)] = gain_i + λ * sensitivity
-    # We solve the dual via bisection on λ
+    # Wasserstein DRO dual reformulation (Eq. 27):
+    #   min_{λ≥0} { λε + (1/N) Σ_i sup_ξ [gain(ξ) - λ d(ξ, ξ_i)] }
+    # With a log-SNR ground metric and gain as the objective, sup_ξ for scenario i
+    # shifts each link's SNR to improve gain. We bound the per-scenario sup by the
+    # Lipschitz sensitivity of gain to log-SNR, which is proportional to the
+    # per-scenario gain spread. This yields a meaningful worst-case robust gain:
+    #   robust ≈ λε + mean_i[gain_i] - λ * mean_i[sens_i]
+    # We compute sens_i as the per-scenario absolute gain deviation (a local
+    # sensitivity proxy), then minimize the dual over λ by bisection.
+    sens = np.abs(gains - mean_gain)  # per-scenario sensitivity proxy
+    mean_sens = float(np.mean(sens)) if sens.size else 0.0
+
     def dual_objective(lambda_dual):
-        # For each scenario i: sup_ξ [gain(ξ) - λ d(ξ, ξ_i)]
-        # Approximation: gain_i + λ * (local sensitivity)
-        # With quadratic metric, sensitivity ≈ std_gain
-        scenario_dual = np.zeros_like(gains)
-        for i in range(len(gains)):
-            scenario_dual[i] = gains[i] - lambda_dual * std_gain
-        return lambda_dual * epsilon + np.mean(scenario_dual)
+        # sup_ξ [gain(ξ) - λ d(ξ, ξ_i)] ≈ gain_i + (sens_i - λ * sens_i).clip(min=0)
+        # Simplification: gain_i - λ * sens_i (worst-case drop bounded by sensitivity)
+        scenario_dual = gains - lambda_dual * sens
+        return lambda_dual * epsilon + float(np.mean(scenario_dual))
 
-    # Bisection to find optimal λ
+    # Bisection to find optimal λ (minimizer of the dual, λ ≥ 0)
     lambda_opt = 0.0
-    if std_gain > 1e-12:
-        lo, hi = 0.0, epsilon * 10.0
-        for _ in range(30):
-            mid = (lo + hi) / 2.0
-            if mid > 0:
-                val = dual_objective(mid)
-                # Check if we can improve by increasing lambda
-                if val < lambda_opt * epsilon + np.mean(gains):
-                    hi = mid
-                else:
-                    lo = mid
-        lambda_opt = (lo + hi) / 2.0
+    if mean_sens > 1e-12 and epsilon > 0:
+        lo, hi = 0.0, max(1.0, (mean_gain - np.min(gains)) / max(mean_sens, 1e-12))
+        best_val = float('inf')
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            val = dual_objective(mid)
+            # Derivative of dual wrt λ: epsilon - mean_sens (constant here), so the
+            # dual is linear in λ; optimum sits at a boundary. Track the best.
+            if val < best_val:
+                best_val = val
+                lambda_opt = mid
+            # Move toward the region that reduces the objective
+            if epsilon - mean_sens > 0:
+                hi = mid  # increasing λ raises objective → shrink
+            else:
+                lo = mid  # increasing λ lowers objective → grow
+        # Evaluate endpoints explicitly since the dual is piecewise-linear
+        for cand in (0.0, lo, hi, lambda_opt):
+            val = dual_objective(cand)
+            if val < best_val:
+                best_val = val
+                lambda_opt = cand
 
-    # Robust gain via Wasserstein dual
+    # Robust gain via Wasserstein dual (worst-case expected gain)
     robust_gain = dual_objective(lambda_opt)
+
+    # Blend with empirical CVaR so the tail risk directly shapes the score:
+    # prefer the more conservative of the Wasserstein bound and the CVaR of gains.
+    robust_gain = min(robust_gain, cvar_gains)
 
     # CVaR of latency deltas (upper tail for worst latency increases)
     latency_cvar = compute_cvar_empirical(scenario_latency_deltas, alpha=0.95) if len(scenario_latency_deltas) > 0 else 0.0
 
-    # Combined robust objective: robust gain - latency penalty
-    LAMBDA_LATENCY = 0.5
-    robust_gain = robust_gain - LAMBDA_LATENCY * float(latency_cvar)
+    # Combined robust objective: robust gain - latency penalty.
+    # Skip the latency penalty on the very first pick (S empty): lat_before is
+    # undefined and would otherwise penalize the best first server.
+    if len(S) > 0:
+        LAMBDA_LATENCY = 0.5
+        robust_gain = robust_gain - LAMBDA_LATENCY * float(latency_cvar)
 
     # Fallback if robust gain is too small but mean gain is positive
     if robust_gain < 1e-6 and mean_gain > 0:

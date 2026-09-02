@@ -67,13 +67,10 @@ def _compute_objective_core(servers, clients, alpha, beta, delta_list, snr_map=N
         # Return a large cost for empty placement
         return float(len(clients) * 1000.0)
 
-    # If using hierarchical AMSE, compute globally
+    # If using hierarchical AMSE, compute per-client so AMSE differentiates servers
     if use_hierarchical:
-        from simulation.topology.aircomp import compute_amse_hierarchical
-        sigma2 = np.mean([c.noise_variance for c in clients]) if clients else 1e-9
-        d = clients[0].gradient_dim if clients else 100
+        from simulation.topology.aircomp import compute_amse_kn_hierarchical
         tier_sync_errors = {1: 1e-9, 2: 5e-9, 3: 1e-8}
-        amse_global = compute_amse_hierarchical(servers, clients, delta_list, t_now, tier_sync_errors)
 
         total_cost = 0.0
         for client in clients:
@@ -84,9 +81,12 @@ def _compute_objective_core(servers, clients, alpha, beta, delta_list, snr_map=N
                 else:
                     latency = float(client.get_latency_to(server, t_now))
 
-                # Use global hierarchical AMSE (same for all clients in this placement)
-                # For marginal gain, we'd need per-client hierarchical AMSE
-                amse_kn = amse_global
+                # Per-client hierarchical AMSE for THIS server: differentiates
+                # candidates and consumes the scenario snr_map when provided.
+                amse_kn = compute_amse_kn_hierarchical(
+                    client, [server], delta_list, t_now=t_now,
+                    tier_sync_errors=tier_sync_errors, snr_map=snr_map,
+                )
                 cost = weighted_compound_loss(latency, amse_kn, alpha, beta)
                 best_cost = min(best_cost, cost)
 

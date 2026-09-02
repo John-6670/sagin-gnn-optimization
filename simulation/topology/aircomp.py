@@ -116,7 +116,7 @@ def compute_amse_n(snr_dict, sigma2, d, sync_error=0.0):
     return amse * 1e-9
 
 
-def compute_amse_hierarchical(servers, clients, delta_list, t_now=None, tier_sync_errors=None):
+def compute_amse_hierarchical(servers, clients, delta_list, t_now=None, tier_sync_errors=None, snr_map=None):
     """
     Compute hierarchical AMSE per Eq. 5:
     AMSE_n = Σ_{ℓ=1}^L [ (σ²d / |K_n^(ℓ)|) Σ_{k∈K_n^(ℓ)} 1/SNR_kn^(ℓ) + ε_sync^(ℓ) ]
@@ -127,6 +127,8 @@ def compute_amse_hierarchical(servers, clients, delta_list, t_now=None, tier_syn
         delta_list: List of cascaded errors per tier [δ_1, δ_2, δ_3]
         t_now: Current time (skyfield Time object or None)
         tier_sync_errors: Dict mapping tier to sync error
+        snr_map: Optional {client: {server: snr}} — when given (e.g. DRO scenario),
+            use these SNR values instead of computing fresh instantaneous SNR.
 
     Returns:
         float: Total hierarchical AMSE
@@ -162,7 +164,12 @@ def compute_amse_hierarchical(servers, clients, delta_list, t_now=None, tier_syn
                 if client_node is None:
                     continue
 
-                snr = client_node.compute_snr_to(agg_node, t_now)
+                if snr_map is not None:
+                    snr = snr_map.get(client_node, {}).get(agg_node, None)
+                    if snr is None:
+                        snr = client_node.compute_snr_to(agg_node, t_now)
+                else:
+                    snr = client_node.compute_snr_to(agg_node, t_now)
                 if snr > 1e-12:
                     snr_sum_inv += 1.0 / snr
                     valid_count += 1
@@ -176,10 +183,13 @@ def compute_amse_hierarchical(servers, clients, delta_list, t_now=None, tier_syn
     return total_amse
 
 
-def compute_amse_kn_hierarchical(client: Node, servers, delta_list, t_now=None, tier_sync_errors=None):
+def compute_amse_kn_hierarchical(client: Node, servers, delta_list, t_now=None, tier_sync_errors=None, snr_map=None):
     """
     Compute AMSE for a specific client given the hierarchical server path.
     Used for marginal gain calculations.
+
+    If snr_map is provided ({client: {server: snr}}), use those SNR values
+    (e.g. DRO scenario samples) instead of computing fresh instantaneous SNR.
     """
     if not servers:
         return float("inf")
@@ -206,7 +216,12 @@ def compute_amse_kn_hierarchical(client: Node, servers, delta_list, t_now=None, 
         tier_delta = delta_list[tier_idx - 1] if tier_idx <= len(delta_list) else 0.0
         sync_err = compute_sync_error(tier_idx, tier_sync_errors)
 
-        snr = client.compute_snr_to(aggregator, t_now)
+        if snr_map is not None:
+            snr = snr_map.get(client, {}).get(aggregator, None)
+            if snr is None:
+                snr = client.compute_snr_to(aggregator, t_now)
+        else:
+            snr = client.compute_snr_to(aggregator, t_now)
         if snr > 1e-12:
             cascaded_error = np.prod([1.0 + delta_list[i] for i in range(tier_idx)]) if tier_idx <= len(delta_list) else 1.0
             total_amse += (client.noise_variance * client.gradient_dim / snr) * cascaded_error * 1e-9 + sync_err

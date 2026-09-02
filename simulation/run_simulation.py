@@ -9,7 +9,8 @@ from skyfield.api import load
 
 from simulation.config_loader import load_config
 from simulation.topology.nodes import Node, NodeType, generate_nodes
-from simulation.topology.aircomp import compute_amse_n
+from simulation.topology.aircomp import compute_amse_n, compute_amse_hierarchical
+from optimization.objective import clear_orbital_cache
 from simulation.topology.patching import hybrid_patch
 from simulation.traffic.traffic_generator import generate_spatiotemporal_traffic
 from simulation.environment.weather import TwoStateWeatherMarkov
@@ -600,6 +601,9 @@ def _run_bilevel_simulation(
             # Only re-run placement for DRO/DR-Greedy algorithms that support scenario-based re-selection
             is_dro_algo = 'dr_greedy' in tag.lower() or 'dro' in tag.lower() or 'dr_' in tag.lower()
             if is_dro_algo and placement_algo is not None:
+                # Expire stale orbital-average SNR before re-selection (satellite
+                # geometry changes over the 30-min outer interval)
+                clear_orbital_cache()
                 selected = placement_algo(
                     candidates=candidates, clients=clients, budget=budget, cost=cost,
                     thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list,
@@ -631,14 +635,18 @@ def _run_bilevel_simulation(
         )
 
         # === Compute metrics ===
-        amse_vals = []
-        for s in selected:
-            snr_dic = {c: c.compute_snr_to(s, t_now) for c in clients}
-            amse_vals.append(compute_amse_n(snr_dic, sigma2=10, d=100))
+        # Evaluate with the SAME hierarchical AMSE the placement optimizes, using
+        # the real noise variance and gradient dimension (not hardcoded 10/100).
+        tier_sync_errors = {1: 1e-9, 2: 5e-9, 3: 1e-8}
+        if selected and clients:
+            amse = compute_amse_hierarchical(
+                selected, clients, delta_list, t_now=t_now, tier_sync_errors=tier_sync_errors
+            )
+        else:
+            amse = 0.0
 
         lat = compute_e2e_latency(clients, selected, t_now)
         energy = compute_total_energy(clients, selected, ota, transmission_time=time_step_seconds, t_now=t_now)
-        amse = float(np.mean(amse_vals)) if amse_vals else 0.0
 
         # Rolling CVaR
         window_size = 30
@@ -790,13 +798,13 @@ def main():
 
     # ====================== Algorithms Dictionary ======================
     algorithms = {
-        "lop": lop_selection,
+        # "lop": lop_selection,
         "go": go_selection,
-        "nrs": nrs_selection,
+        # "nrs": nrs_selection,
         "random": random_selection,
         "da": da_selection,
-        "fedsn": fedsn_selection,
-        "hsfl": hsfl_selection,
+        # "fedsn": fedsn_selection,
+        # "hsfl": hsfl_selection,
         "dr_greedy": dr_selection,
     }
 

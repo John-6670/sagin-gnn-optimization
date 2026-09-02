@@ -350,15 +350,15 @@ def dr_greedy_server_selection(candidates, clients, budget, cost, thresh, alpha,
         from simulation.topology.aircomp import compute_amse_hierarchical
         tier_sync_errors = {1: 1e-9, 2: 5e-9, 3: 1e-8}
         for snr_map in scenario_maps:
-            # Use hierarchical AMSE for scaling
-            amse_val = compute_amse_hierarchical(C, clients, delta_list, t_now=t_now, tier_sync_errors=tier_sync_errors)
+            # Use hierarchical AMSE for scaling, honoring the scenario snr_map
+            amse_val = compute_amse_hierarchical(C, clients, delta_list, t_now=t_now, tier_sync_errors=tier_sync_errors, snr_map=snr_map)
             amse_scale_values.append(amse_val)
     amse_scale = max(_np.percentile(amse_scale_values, 95) if amse_scale_values else 1.0, 1e-12)
 
     bundle = ScenarioBundle(scenarios=scenario_maps, clients=clients, candidates=C,
                             delta_list=delta_list, alpha=alpha, beta=beta,
                             latency_map=latency_map, latency_scale=latency_scale,
-                            amse_scale=amse_scale)
+                            amse_scale=amse_scale, t_now=t_now, use_hierarchical=True)
     print(f"DR-Greedy: Starting robust selection with {len(C)} candidates and budget {budget}")
 
     S, total_cost, remaining = [], 0.0, list(C)
