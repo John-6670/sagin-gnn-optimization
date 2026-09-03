@@ -73,7 +73,7 @@ algorithm:
   num_scenarios: 64
 gnn:
   checkpoint: checkpoints/sagin_hgnn.pt
-  kappa: 0.3
+  kappa: 0.6
   epochs: 200
   batch_size: 512
   lr: 0.001

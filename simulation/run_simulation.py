@@ -598,8 +598,11 @@ def _run_bilevel_simulation(
             log.info(f"[{tag}] Step {step}: Running OUTER loop (placement re-selection)")
             old_selected = selected
 
-            # Only re-run placement for DRO/DR-Greedy algorithms that support scenario-based re-selection
-            is_dro_algo = 'dr_greedy' in tag.lower() or 'dro' in tag.lower() or 'dr_' in tag.lower()
+            # Re-run placement for DRO/DR-Greedy algorithms that support scenario-based
+            # re-selection, and for random (a moving baseline that re-randomizes each interval).
+            tag_l = tag.lower()
+            is_dro_algo = 'dr_greedy' in tag_l or 'dro' in tag_l or 'dr_' in tag_l
+            is_random_algo = 'random' in tag_l
             if is_dro_algo and placement_algo is not None:
                 # Expire stale orbital-average SNR before re-selection (satellite
                 # geometry changes over the 30-min outer interval)
@@ -608,6 +611,13 @@ def _run_bilevel_simulation(
                     candidates=candidates, clients=clients, budget=budget, cost=cost,
                     thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list,
                     N=N, t_now=t_now
+                )
+            elif is_random_algo and placement_algo is not None:
+                # Re-randomize each outer interval with a step-varying seed
+                selected = placement_algo(
+                    candidates=candidates, clients=clients, budget=budget, cost=cost,
+                    thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list,
+                    N=N, t_now=t_now, seed=int(step)
                 )
             else:
                 # For non-DRO algorithms, keep the initial placement but allow pruning
@@ -736,10 +746,13 @@ def run_full_sweep(
             log.info("Running simulation for algorithm: %s", name)
 
             t_now = start  # use start time for initial selection
-            selected = algo(
+            init_kwargs = dict(
                 candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
                 alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
             )
+            if 'random' in name.lower():
+                init_kwargs['seed'] = 0  # reproducible initial placement for the random baseline
+            selected = algo(**init_kwargs)
 
             # Run bilevel simulation for this algorithm
             _run_bilevel_simulation(
@@ -799,10 +812,10 @@ def main():
     # ====================== Algorithms Dictionary ======================
     algorithms = {
         # "lop": lop_selection,
-        "go": go_selection,
+        # "go": go_selection,
         # "nrs": nrs_selection,
-        "random": random_selection,
-        "da": da_selection,
+        # "random": random_selection,
+        # "da": da_selection,
         # "fedsn": fedsn_selection,
         # "hsfl": hsfl_selection,
         "dr_greedy": dr_selection,

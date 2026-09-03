@@ -76,7 +76,7 @@ def nrs_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_
     )
 
 
-def random_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N, t_now=None):
+def random_selection(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N, t_now=None, seed=None):
     if not clients:
         return []
 
@@ -86,7 +86,7 @@ def random_selection(candidates, clients, budget, cost, thresh, alpha, beta, del
     C = [s for s in candidates if average_snr(s) >= thresh]
     total_cost = 0
     selected = []
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(seed)
 
     while C:
         s = rng.choice(C)
