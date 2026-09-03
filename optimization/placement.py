@@ -288,7 +288,7 @@ def greedy_server_selection(candidates, clients, budget, cost: dict[Node, float]
             break
 
         delta_snr = sum(max(0.0, snr_map[c][best_server] - best_snr[c]) for c in clients)
-        if delta_snr > thresh and total_cost + cost[best_server] <= budget:
+        if delta_snr >= thresh and total_cost + cost[best_server] <= budget:
             S.append(best_server)
             total_cost += cost[best_server]
             for c in clients:
