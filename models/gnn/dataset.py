@@ -185,8 +185,8 @@ class SAGINSnapshotDataset(Dataset):
         Must be called before training. Use PrecomputedGraphDataset for
         cached snapshots data.
         """
-        from configs.default import load_config
-        config = load_config()
+        from simulation.config_loader import load_config
+        config = load_config("configs/default.yaml")
 
         self.labels_cache = {}
         alpha = config.get('algorithm', {}).get('alpha', 0.5)
@@ -194,9 +194,10 @@ class SAGINSnapshotDataset(Dataset):
         delta_list = config.get('algorithm', {}).get('delta_list', [0.1, 0.05])
 
         for idx in range(self.num_samples):
-            print(f"[Dataset] processing sample {idx}/{self.num_samples}")
+            if idx % 25 == 0 or idx == self.num_samples - 1:
+                print(f"[Dataset] processing sample {idx}/{self.num_samples}", flush=True)
 
-            clients_n = 500
+            clients_n = 125
 
             nodes = generate_nodes(
                 num_sats=36, num_uavs=8, num_ground=20,
@@ -240,8 +241,11 @@ class SAGINSnapshotDataset(Dataset):
                     labels.append(float(gain))
 
                 labels = np.asarray(labels, dtype=np.float32)
-                if len(labels) > 1:
-                    labels = (labels - labels.mean()) / (labels.std() + 1e-6)
+                std = labels.std()
+                if len(labels) > 1 and np.isfinite(std) and std > 1e-6:
+                    labels = (labels - labels.mean()) / std
+                else:
+                    labels = np.zeros_like(labels)  # uniform gains -> no ranking signal
 
                 label_dict[t] = torch.tensor(labels, dtype=torch.float32)
 

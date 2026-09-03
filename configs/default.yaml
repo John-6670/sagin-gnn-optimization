@@ -11,8 +11,6 @@ simulation:
   duration_hours: 6
   time_step_seconds: 60
   outer_interval_minutes: 30
-
-
 nodes:
   satellite:
     altitude_km: 550.0
@@ -22,7 +20,6 @@ nodes:
     power_w: 500.0
     coverage_radius_km: 1100.0
     motion: keplerian
-  
   uav:
     altitude_km: 20.0
     power_w: 10.0
@@ -30,7 +27,6 @@ nodes:
     deployment: hexagonal
     coverage_radius_km: 100.0
     motion: station_keeping
-  
   ground:
     urban_macro:
       count: 6
@@ -53,7 +49,6 @@ nodes:
       antenna_gain_dbi: 17
       power_w: 40.0
       motion: stationary
-  
   client:
     stationary_fraction: 0.6
     pedestrian_fraction: 0.2
@@ -61,39 +56,32 @@ nodes:
     urban_fraction: 0.7
     rural_fraction: 0.3
     power_w: 0.1
-
-
 algorithm:
   alpha: 0.5
   beta: 0.5
-  budget: 20
+  budget: 50
   delta_list:
   - 0.1
   - 0.05
   snr_threshold: 0.0
   target_snr: 1.0
-  # DRO parameters
   epsilon_wasserstein: 0.15
   tau_amse: 1.0
   alpha_cvar: 0.95
   coherence_time: 25.0
   sigma_snr: 0.35
   num_scenarios: 64
-
-
 gnn:
   checkpoint: checkpoints/sagin_hgnn.pt
   kappa: 0.3
-  # Training hyperparameters
   epochs: 200
-  batch_size: 32
+  batch_size: 512
   lr: 0.001
   loss_weight_submod: 0.1
   loss_weight_snr_grad: 0.05
-
 channel:
-  carrier_freq_hz: 2400000000.0  # 2.4 GHz
-  bandwidth_hz: 20000000.0       # 20 MHz
+  carrier_freq_hz: 2400000000.0
+  bandwidth_hz: 20000000.0
   link_params:
     leo_ground:
       k_db: 10.0
@@ -107,12 +95,9 @@ channel:
     leo_hap:
       k_db: 8.0
       coherence_time_s: 12.0
-
 weather:
   atmospheric_loss_clear_db: 2.0
   atmospheric_loss_rain_db: 4.0
-
-# Node distribution fractions
 node_distribution:
   client:
     stationary: 0.6

@@ -114,7 +114,7 @@ nodes:
       motion: stationary
     rural:
       count: 1
-      isd_m: 1732
+      isd_m: 17bi5ixbfbbbbbbbbbbberererererqop[eritq[poeruywoietuyqwerrrrrrrrrrqwoieiruiqwuu]]
       height_m: 35
       antenna_gain_dbi: 17
       power_w: 40.0
@@ -125,8 +125,7 @@ nodes:
     vehicular_fraction: 0.2
     urban_fraction: 0.7
     rural_fraction: 0.3
-    power_w: 0.1
-
+    power_w: 0.1  \q]we[rt;y;iuop[y]\tryitoprtyoptr[yutuyyytitiroerr[rrrrrrrrrrrrrrrre[rptiouyw]peiortuy]rptiouy[repotiyuprtoy9uirtoiurotiuotiyyt pioutyrpotiryutryoitpuiorytuipoyrtpuiroyrytriyotryioptrypuiroyeyuioptuyiporyiepuotryeuioptryieouryepiutuyirpeutirpey treyupetyuipotyreuyieopertyuiprtieyp otruiptriyep uit iprtrt uipt ruioyrt eyrt eyiptr euipyt uiypr rueiopyt uprieoy eturiopyuip uit ueriopt eryt eryipu peorti upeoryy uipore yipuorpio yerpet ioruytir puyou iypptuiry oir oyuueitopry tr oyt oytiu opeytyieru oituyoptyytuyyyyyyyyyuyuyyuuyuyuyyu]]
 algorithm:
   alpha: 0.5
   beta: 0.5

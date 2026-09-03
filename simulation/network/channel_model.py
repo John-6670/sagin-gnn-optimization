@@ -125,6 +125,9 @@ class SaginChannelModel:
 
     def _rician_or_rayleigh(self, link_type: LinkType) -> complex:
         k_db = self.link_params[link_type].k_db
+        # YAML parses "-inf" as the string "-inf", not a float — coerce before isneginf
+        if isinstance(k_db, str):
+            k_db = float(k_db)
         if np.isneginf(k_db):
             return (self.rng.normal() + 1j * self.rng.normal()) / np.sqrt(2.0)
         k_lin = 10 ** (k_db / 10.0)

@@ -25,7 +25,7 @@ class PrecomputedGraphDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        return torch.load(self.files[idx])
+        return torch.load(self.files[idx], weights_only=False)
 
 
 def train_gnn(epochs=None, batch_size=None, lr=None, checkpoint_path=None):
@@ -50,7 +50,7 @@ def train_gnn(epochs=None, batch_size=None, lr=None, checkpoint_path=None):
                               pin_memory=True, num_workers=2)
 
     # Load one sample for metadata
-    sample = torch.load("precomputed_dataset/sample_train_0.pt") if train_ds.files else torch.load("precomputed_dataset/sample_0.pt")
+    sample = torch.load("precomputed_dataset/sample_train_0.pt", weights_only=False) if train_ds.files else torch.load("precomputed_dataset/sample_0.pt", weights_only=False)
     in_dims = {k: sample[k].x.shape[1] for k in sample.node_types}
 
     model = SAGINHeteroGNN(sample.metadata(), in_dims=in_dims).to(device)
@@ -66,7 +66,7 @@ def train_gnn(epochs=None, batch_size=None, lr=None, checkpoint_path=None):
     accumulation_steps = 2
 
     print("=" * 70)
-    print(f"Dataset → Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
+    print(f"Dataset -> Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
     print(f"Batch size: {batch_size} | Epochs: {epochs}")
     print("=" * 70)
 
@@ -109,13 +109,17 @@ def train_gnn(epochs=None, batch_size=None, lr=None, checkpoint_path=None):
 
                 # SNR gradient penalty: use actual SNR feature (index 4: mean_snr after P0.3)
                 # Before P0.3: index 2 is noise_variance. After: SNR stats at indices 4-7
-                snr_feature_idx = 2  # Current noise_variance feature
+                snr_feature_idx = 6  # snr_mean in [pos(3), vel(3), snr_mean(6), snr_max, snr_min, snr_std, load, one-hot(4)]
                 if batch[nt].x.size(1) > snr_feature_idx:
                     snr_feature = batch[nt].x[:min_len, snr_feature_idx]
                     if snr_feature.requires_grad:
                         lsnr_part = snr_penalty(pred[:min_len], snr_feature)
 
                 loss += mse_part + gnn_cfg.get('loss_weight_submod', 0.1) * lsub_part + gnn_cfg.get('loss_weight_snr_grad', 0.05) * lsnr_part
+
+            if not torch.isfinite(loss):
+                opt.zero_grad()
+                continue
 
             loss = loss / accumulation_steps
             loss.backward()
@@ -130,8 +134,9 @@ def train_gnn(epochs=None, batch_size=None, lr=None, checkpoint_path=None):
             epoch_loss += loss.item() * accumulation_steps
 
             if batch_idx % 10 == 0:
+                grad_str = f"{grad_norm:.4f}" if isinstance(grad_norm, float) is False or grad_norm == grad_norm else "n/a"
                 print(f"[Epoch {epoch+1:02d}] Batch {batch_idx:03d}/{len(train_loader)} | "
-                      f"Loss={loss.item() * accumulation_steps:.6f} | Grad={grad_norm:.4f}")
+                      f"Loss={loss.item() * accumulation_steps:.6f} | Grad={grad_str}")
 
         # ====================== VALIDATION ======================
         model.eval()
@@ -177,10 +182,10 @@ def train_gnn(epochs=None, batch_size=None, lr=None, checkpoint_path=None):
             no_improve_epochs = 0
             Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), checkpoint_path)
-            print(f"  → Best model saved (ValLoss = {val_loss:.6f})")
+            print(f"  -> Best model saved (ValLoss = {val_loss:.6f})")
         else:
             no_improve_epochs += 1
-            print(f"  → No improvement for {no_improve_epochs}/{patience} epochs")
+            print(f"  -> No improvement for {no_improve_epochs}/{patience} epochs")
             if no_improve_epochs >= patience:
                 print(f"Early stopping triggered after {epoch+1} epochs.")
                 break

@@ -64,9 +64,9 @@ class SAGINHeteroGNN(nn.Module):
             h = torch.cat([emb, ctx], dim=-1)
 
             if k in self.heads:
-                pred[k] = F.relu(self.heads[k](h).squeeze(-1))
+                pred[k] = self.heads[k](h).squeeze(-1)
             else:
-                pred[k] = F.relu(self.heads["ground"](h).squeeze(-1))
+                pred[k] = self.heads["ground"](h).squeeze(-1)
 
         return pred
 
