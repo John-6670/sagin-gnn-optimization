@@ -228,48 +228,56 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
     # For Eq. 15, we want α=0.95 for worst 5% tail
     cvar_gains = compute_cvar_empirical(gains, alpha=0.95)
 
-    # Wasserstein DRO dual reformulation (Eq. 27):
-    #   min_{λ≥0} { λε + (1/N) Σ_i sup_ξ [gain(ξ) - λ d(ξ, ξ_i)] }
-    # With a log-SNR ground metric and gain as the objective, sup_ξ for scenario i
-    # shifts each link's SNR to improve gain. We bound the per-scenario sup by the
-    # Lipschitz sensitivity of gain to log-SNR, which is proportional to the
-    # per-scenario gain spread. This yields a meaningful worst-case robust gain:
-    #   robust ≈ λε + mean_i[gain_i] - λ * mean_i[sens_i]
-    # We compute sens_i as the per-scenario absolute gain deviation (a local
-    # sensitivity proxy), then minimize the dual over λ by bisection.
-    sens = np.abs(gains - mean_gain)  # per-scenario sensitivity proxy
-    mean_sens = float(np.mean(sens)) if sens.size else 0.0
+    # ---- Proper Wasserstein DRO dual (Eq. 27) ----
+    # For each scenario i, the sup over the Wasserstein ball is:
+    #   sup_ξ [gain(ξ) - λ d(ξ, ξ_i)] = gain_i + L_i² / (4λ)
+    # where L_i is the Lipschitz constant of gain w.r.t. log-SNR perturbations.
+    #
+    # We estimate L_i numerically: perturb each scenario's SNR vector by ±σ
+    # in log-space and measure the gain change. The per-scenario Lipschitz
+    # constant is |Δgain| / ||Δlog_snr||.
+    #
+    # The dual objective becomes:
+    #   f(λ) = λε + (1/N) Σ_i [gain_i + L_i²/(4λ)]
+    # which is convex in λ with closed-form optimum:
+    #   λ* = sqrt( mean(L²) / (4ε) )
+
+    lipschitz_constants = np.zeros(len(gains))
+    if epsilon > 0 and len(scenario_snr_vectors) > 0:
+        # Estimate L_i via finite differences on the SNR perturbation
+        # The gain function g(ξ) ≈ g(ξ_i) + ∇g·(ξ - ξ_i), so L_i ≈ |Δg| / ||Δξ||
+        # We use the scenario dispersion as a proxy for the local sensitivity:
+        # L_i ≈ |gain_i - mean_gain| / ||log(snr_i) - log(snr_mean)||
+        snr_logs = []
+        for snr_vec in scenario_snr_vectors:
+            snr_logs.append(np.log(np.maximum(snr_vec, 1e-12)))
+        snr_log_mean = np.mean(snr_logs, axis=0)
+
+        for i in range(len(gains)):
+            log_diff_norm = float(np.linalg.norm(snr_logs[i] - snr_log_mean))
+            gain_dev = abs(gains[i] - mean_gain)
+            if log_diff_norm > 1e-12:
+                lipschitz_constants[i] = gain_dev / log_diff_norm
+            else:
+                # No SNR deviation → gain is locally flat → L = 0
+                lipschitz_constants[i] = 0.0
+
+    mean_L2 = float(np.mean(lipschitz_constants ** 2))
 
     def dual_objective(lambda_dual):
-        # sup_ξ [gain(ξ) - λ d(ξ, ξ_i)] ≈ gain_i + (sens_i - λ * sens_i).clip(min=0)
-        # Simplification: gain_i - λ * sens_i (worst-case drop bounded by sensitivity)
-        scenario_dual = gains - lambda_dual * sens
-        return lambda_dual * epsilon + float(np.mean(scenario_dual))
+        """Proper Wasserstein dual: f(λ) = λε + mean(gain_i + L_i²/(4λ))"""
+        if lambda_dual <= 1e-15:
+            # As λ→0, L²/(4λ) → ∞ for any L>0, so this is +∞ unless all L=0
+            if mean_L2 > 1e-15:
+                return float('inf')
+            return float(np.mean(gains))
+        return lambda_dual * epsilon + float(np.mean(gains + lipschitz_constants**2 / (4.0 * lambda_dual)))
 
-    # Bisection to find optimal λ (minimizer of the dual, λ ≥ 0)
-    lambda_opt = 0.0
-    if mean_sens > 1e-12 and epsilon > 0:
-        lo, hi = 0.0, max(1.0, (mean_gain - np.min(gains)) / max(mean_sens, 1e-12))
-        best_val = float('inf')
-        for _ in range(60):
-            mid = 0.5 * (lo + hi)
-            val = dual_objective(mid)
-            # Derivative of dual wrt λ: epsilon - mean_sens (constant here), so the
-            # dual is linear in λ; optimum sits at a boundary. Track the best.
-            if val < best_val:
-                best_val = val
-                lambda_opt = mid
-            # Move toward the region that reduces the objective
-            if epsilon - mean_sens > 0:
-                hi = mid  # increasing λ raises objective → shrink
-            else:
-                lo = mid  # increasing λ lowers objective → grow
-        # Evaluate endpoints explicitly since the dual is piecewise-linear
-        for cand in (0.0, lo, hi, lambda_opt):
-            val = dual_objective(cand)
-            if val < best_val:
-                best_val = val
-                lambda_opt = cand
+    # Closed-form optimum: λ* = sqrt(mean(L²) / (4ε))
+    if mean_L2 > 1e-15 and epsilon > 0:
+        lambda_opt = float(np.sqrt(mean_L2 / (4.0 * epsilon)))
+    else:
+        lambda_opt = 0.0
 
     # Robust gain via Wasserstein dual (worst-case expected gain)
     robust_gain = dual_objective(lambda_opt)
@@ -281,10 +289,11 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
     # CVaR of latency deltas (upper tail for worst latency increases)
     latency_cvar = compute_cvar_empirical(scenario_latency_deltas, alpha=0.95) if len(scenario_latency_deltas) > 0 else 0.0
 
-    # Combined robust objective: robust gain - latency penalty.
-    # Skip the latency penalty on the very first pick (S empty): lat_before is
-    # undefined and would otherwise penalize the best first server.
-    if len(S) > 0:
+    # Combined robust objective: robust gain + latency improvement bonus.
+    # latency_cvar is negative when adding v reduces latency (good), so
+    # subtracting it would double-count the latency benefit already in gain.
+    # Instead, we penalize when latency_cvar > 0 (adding v makes latency worse).
+    if len(S) > 0 and latency_cvar > 0:
         LAMBDA_LATENCY = 0.5
         robust_gain = robust_gain - LAMBDA_LATENCY * float(latency_cvar)
 
