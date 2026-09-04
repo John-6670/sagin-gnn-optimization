@@ -1,40 +1,51 @@
 # SAGIN Placement & AirComp Simulation
 
 This repository is an academic prototype for **Space-Air-Ground Integrated Networks (SAGIN)** with a focus on:
-- function-aware server placement,
-- over-the-air aggregation (AirComp),
-- SNR-driven utility optimization,
-- robust placement via DRO,
-- GNN-based candidate scoring.
+- Function-aware server placement
+- Over-the-air aggregation (AirComp)
+- SNR-driven utility optimization
+- Robust placement via Distributionally Robust Optimization (DRO)
+- GNN-based candidate scoring
 
 The codebase supports simulation, baseline comparisons, GNN dataset generation/training, and robust placement experiments.
 
 ## 📁 Project Structure
 
-- `configs/`
-  - YAML experiment definitions for simulation topology, node types, algorithm parameters, and GNN settings.
-- `simulation/`
-  - `run_simulation.py` — main simulation runner and experiment orchestrator.
-  - `config_loader.py` — YAML config loader.
-  - `topology/` — node generation, AirComp modeling, patching logic.
-  - `traffic/` — spatiotemporal traffic generation.
-  - `environment/` — weather and channel environment.
-  - `evaluation/` — performance metrics and result aggregation.
-- `optimization/`
-  - `placement.py` — core server selection logic, including GREEDY and DRO-GREEDY.
-  - `objective.py` — AMSE and placement cost computation.
-  - `baselines.py` — standard baselines: `lop`, `go`, `nrs`, `random`, `da`, and `dr_greedy`.
-  - `dro.py` — distributionally robust optimization utilities.
-  - `meta_learner.py` — meta-learning support for OTA control.
-- `models/gnn/`
-  - `precompute_dataset.py` — generate graph datasets for GNN training.
-  - `train.py` — train the SAGIN hetero-GNN model.
-  - `dataset.py` — dataset creation and dataset split helpers.
-  - `hgnn.py` — heterogenous graph neural network model definitions.
-- `precomputed_dataset/`
-  - saved graph samples used for GNN training and inference.
-- `checkpoints/`
-  - saved GNN model checkpoints.
+```
+├── configs/
+│   └── default.yaml          # Main experiment configuration
+├── simulation/
+│   ├── run_simulation.py     # Main simulation runner & experiment orchestrator
+│   ├── config_loader.py      # YAML config loader
+│   ├── topology/
+│   │   ├── nodes.py          # Node classes, Walker constellation, client mobility
+│   │   ├── aircomp.py        # Hierarchical AirComp AMSE computation
+│   │   ├── constellation.py  # Walker delta constellation generation
+│   │   └── patching.py       # Hybrid patching for quantization bounds
+│   ├── traffic/
+│   │   └── traffic_generator.py  # Spatiotemporal traffic generation
+│   ├── environment/
+│   │   └── weather.py        # Two-state weather Markov chain
+│   ├── evaluation/
+│   │   └── metrics.py        # E2E latency, energy, CVaR computation
+│   └── network/
+│       └── channel_model.py  # SAGIN channel model (Rician fading, pathloss)
+├── optimization/
+│   ├── placement.py          # Core server selection: greedy, DR-greedy, OTA control
+│   ├── objective.py          # Composite objective (latency + AMSE), marginal gains
+│   ├── baselines.py          # Baseline algorithms: LOP, GO, NRS, Random, DA, DR, FedSN, HSFL
+│   ├── dro.py                # Wasserstein DRO with proper dual reformulation
+│   └── meta_learner.py       # MAML inner optimizer for OTA power control
+├── models/gnn/
+│   ├── precompute_dataset.py # Generate graph datasets (Latin hypercube sampling)
+│   ├── train.py              # Train SAGINHeteroGNN with submodularity + SNR penalties
+│   ├── dataset.py            # PyG HeteroData dataset & splits
+│   └── hgnn.py               # Heterogeneous GNN (HeteroConv + GATConv)
+├── precomputed_dataset/      # Saved graph samples for GNN training
+├── checkpoints/              # GNN model checkpoints (.pt + .meta.pkl)
+├── plots/                    # Generated comparison plots
+└── results/                  # CSV metrics per algorithm
+```
 
 ## 🚀 Quick Start
 
@@ -45,169 +56,160 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 2. Run a simulation
+### 2. Run a simulation (static test mode)
 ```bash
-python -m simulation.run_simulation --config configs/default.yaml --algorithm da --budget 20
+python -m simulation.run_simulation --config configs/default.yaml --algorithm dr_greedy --budget 50 --seed 42
 ```
 
 ### 3. Run all algorithms for comparison
 ```bash
-python -m simulation.run_simulation --config configs/default.yaml --algorithm all
+python -m simulation.run_simulation --config configs/default.yaml --algorithm all --seed 42
 ```
 
-## 🧩 Configuration Type
-
-The primary config file is `configs/default.yaml`.
-It uses the following top-level sections:
-
-- `simulation` — topology, timing, scenario count, and simulation engine settings.
-- `nodes` — per-node-type parameters for satellites, UAVs, ground stations, and clients.
-- `algorithm` — placement objective, budget, thresholds, and DRO/GNN hyperparameters.
-- `gnn` — checkpoint path and inference settings used by the GNN model.
-
-### Example `configs/default.yaml`
-```yaml
-simulation:
-  num_sats: 36
-  num_uavs: 8
-  num_ground: 20
-  num_clients: 500
-  area_size: 2000
-  gradient_dim: 100
-  sigma2: 10
-  algorithm: test
-  num_scenarios: 8
-  duration_hours: 24
-  time_step_seconds: 60
-  outer_interval_minutes: 10
-
-nodes:
-  satellite:
-    altitude_km: 550.0
-    inclination_deg: 53.0
-    num_planes: 3
-    sats_per_plane: 6
-    power_w: 500.0
-    coverage_radius_km: 1100.0
-    motion: keplerian
-  uav:
-    altitude_km: 20.0
-    power_w: 10.0
-    station_keeping_km: 2.0
-    deployment: hexagonal
-    coverage_radius_km: 100.0
-    motion: station_keeping
-  ground:
-    urban_macro:
-      count: 6
-      isd_m: 200
-      height_m: 25
-      antenna_gain_dbi: 17
-      power_w: 40.0
-      motion: stationary
-    urban_micro:
-      count: 3
-      isd_m: 50
-      height_m: 10
-      antenna_gain_dbi: 5
-      power_w: 10.0
-      motion: stationary
-    rural:
-      count: 1
-      isd_m: 17bi5ixbfbbbbbbbbbbberererererqop[eritq[poeruywoietuyqwerrrrrrrrrrqwoieiruiqwuu]]
-      height_m: 35
-      antenna_gain_dbi: 17
-      power_w: 40.0
-      motion: stationary
-  client:
-    stationary_fraction: 0.6
-    pedestrian_fraction: 0.2
-    vehicular_fraction: 0.2
-    urban_fraction: 0.7
-    rural_fraction: 0.3
-    power_w: 0.1  \q]we[rt;y;iuop[y]\tryitoprtyoptr[yutuyyytitiroerr[rrrrrrrrrrrrrrrre[rptiouyw]peiortuy]rptiouy[repotiyuprtoy9uirtoiurotiuotiyyt pioutyrpotiryutryoitpuiorytuipoyrtpuiroyrytriyotryioptrypuiroyeyuioptuyiporyiepuotryeuioptryieouryepiutuyirpeutirpey treyupetyuipotyreuyieopertyuiprtieyp otruiptriyep uit iprtrt uipt ruioyrt eyrt eyiptr euipyt uiypr rueiopyt uprieoy eturiopyuip uit ueriopt eryt eryipu peorti upeoryy uipore yipuorpio yerpet ioruytir puyou iypptuiry oir oyuueitopry tr oyt oytiu opeytyieru oituyoptyytuyyyyyyyyyuyuyyuuyuyuyyu]]
-algorithm:
-  alpha: 0.5
-  beta: 0.5
-  budget: 20
-  delta_list:
-    - 0.1
-    - 0.05
-  snr_threshold: 0.0
-  target_snr: 1.0
-
-gnn:
-  checkpoint: checkpoints/sagin_hgnn.pt
-  kappa: 0.3
+### 4. Dynamic mode (time-evolving, duration > 0 in config)
+```bash
+python -m simulation.run_simulation --config configs/default.yaml --algorithm all --duration 1
 ```
+
+## 🧩 Configuration
+
+Primary config: `configs/default.yaml`
+
+### Key sections:
+| Section | Description |
+|---------|-------------|
+| `simulation` | Topology counts, area, timing, gradient_dim, sigma2, num_scenarios, duration_hours, time_step_seconds, outer_interval_minutes |
+| `nodes` | Per-node-type parameters (satellite, UAV, ground, client) |
+| `algorithm` | alpha, beta, budget, delta_list, snr_threshold, target_snr, epsilon_wasserstein, tau_amse, alpha_cvar, coherence_time, sigma_snr, num_scenarios |
+| `gnn` | checkpoint path, kappa (pruning fraction), epochs, batch_size, lr, loss weights |
+| `channel` | Carrier frequency, bandwidth, link Rician K-factors & coherence times |
+| `weather` | Atmospheric loss for clear/rain states |
+| `node_distribution` | Client & ground BS distribution fractions |
+
+### Node costs (in `run_simulation.py:build_costs()`):
+| Tier | Cost |
+|------|------|
+| Satellite | 10.0 |
+| UAV/HAP | 5.0 |
+| Ground BS | 2.0 |
+
+Budget default: **50**
 
 ## 🎯 Available Simulation Algorithms
 
-The following placement algorithms are available in `simulation/run_simulation.py`:
-- `lop` — latency-only placement.
-- `go` — ground-only greedy placement.
-- `nrs` — non-robust greedy placement without SNR threshold.
-- `random` — random server selection under budget.
-- `da` — SNR+AMSE-aware deterministic adaptive selection.
-- `dr_greedy` — distributionally robust greedy selection using sampled SNR scenarios.
-- `all` / `test` — run every algorithm in the dictionary.
+Run with `--algorithm <name>`:
+| Algorithm | Description |
+|-----------|-------------|
+| `lop` | Latency-only placement (minimizes propagation latency) |
+| `go` | Ground-only greedy (constrains to ground BSs) |
+| `nrs` | Non-robust greedy without SNR threshold |
+| `random` | Random server selection under budget |
+| `da` | SNR+AMSE-aware deterministic adaptive selection |
+| `fedsn` | FedSN-inspired: prioritizes satellites with compute/feasibility proxies |
+| `hsfl` | Hierarchical Split FL baseline (UAV edge + Sat global) |
+| `dr_greedy` | Distributionally robust greedy using sampled SNR scenarios (Wasserstein DRO) |
+| `all` / `test` | Run every algorithm for comparison |
 
-## 🔄 DRO Flow
+## 🔄 DRO Flow (Proper Wasserstein Dual)
 
-The DRO flow in this repository works as follows:
-1. sample multiple SNR scenarios to represent channel uncertainty.
-2. compute robust marginal gains for candidate servers across scenarios.
-3. greedily select servers while respecting the budget and SNR thresholds.
-4. output a robust set of selected servers that trades off latency and AMSE.
+The DRO implementation now uses a **correct Wasserstein dual reformulation** per Eq. 27:
 
-This is implemented via `optimization.placement.dr_greedy_server_selection()` and exposed through `optimization.baselines.dr_selection()`.
+1. **Sample N SNR scenarios** with OU temporal perturbation (orbital-average for satellites, instantaneous for HAP/ground)
+2. **Compute per-scenario marginal gains** `gain_i = Cost(S) - Cost(S ∪ {v})` using hierarchical AMSE
+3. **Estimate Lipschitz constants** `L_i` from scenario dispersion in log-SNR space
+4. **Solve the dual** `min_λ≥0 { λε + (1/N) Σ_i [gain_i + L_i²/(4λ)] }` with closed-form optimum `λ* = sqrt(mean(L²) / (4ε))`
+5. **Robust gain** = `dual(λ*)` blended with empirical CVaR: `min(robust_gain, CVaR_α(gains))`
+6. **Cost-normalized greedy selection** (gain/cost) + local 1-swap refinement
 
-## 🧪 Simulation Workflow
+This replaces the previous linear approximation that collapsed to boundary solutions.
 
-The end-to-end experiment flow is:
+## 🧪 GNN Pipeline
 
-1. **Generate a precomputed GNN dataset**
-   ```bash
-   python models/gnn/precompute_dataset.py
-   ```
-   This creates `precomputed_dataset/sample_train_*.pt`, `sample_val_*.pt`, and `sample_test_*.pt` files.
+### 1. Generate precomputed dataset (~14k samples, Latin hypercube)
+```bash
+python models/gnn/precompute_dataset.py
+```
+Outputs: `precomputed_dataset/sample_train_*.pt`, `sample_val_*.pt`, `sample_test_*.pt`
 
-2. **Train the GNN model**
-   ```bash
-   python models/gnn/train.py
-   ```
-   This loads precomputed dataset files, trains `SAGINHeteroGNN`, saves a checkpoint to `checkpoints/sagin_hgnn.pt`, and updates `configs/default.yaml`.
+### 2. Train GNN model
+```bash
+python models/gnn/train.py
+```
+- Architecture: `SAGINHeteroGNN` (HeteroConv + GATConv, hidden=128, 3 layers, 4 heads)
+- Loss: MSE + submodularity regularizer + SNR gradient penalty
+- Scheduler: CosineAnnealingLR, early stopping (patience=20)
+- Outputs: `checkpoints/sagin_hgnn.pt` + `checkpoints/sagin_hgnn.meta.pkl`
+- Updates `configs/default.yaml` `gnn.checkpoint` path
 
-3. **Run the simulation**
-   ```bash
-   python -m simulation.run_simulation --config configs/default.yaml --algorithm dr_greedy --budget 20
-   ```
-   Use `--algorithm` to choose one of the supported strategies.
+### 3. Run simulation with GNN-enhanced selection
+```bash
+python -m simulation.run_simulation --config configs/default.yaml --algorithm dr_greedy --budget 50
+```
+GNN scores candidates by marginal utility gain; downweights satellites (0.6×) and UAVs (0.85×).
 
 ## 🛠️ Simulation CLI Options
 
-`simulation/run_simulation.py` supports the following command-line arguments:
-- `--config` — config file path (default: `configs/default.yaml`).
-- `--budget` — override the placement budget.
-- `--seed` — random seed (default: `123`).
-- `--algorithm` — algorithm name or `all`.
-- `--fl` — run federated learning experiments.
-- `--task` — select a federated task when `--fl` is used.
-- `--results-tag` — optional suffix for results filenames.
-- `--sensitivity` — run DRO sensitivity analysis and ablation.
+| Argument | Description |
+|----------|-------------|
+| `--config` | Config file path (default: `configs/default.yaml`) |
+| `--budget` | Override placement budget |
+| `--seed` | Random seed (default: `123`) |
+| `--algorithm` | Algorithm name or `all` |
+| `--fl` | Run federated learning experiments |
+| `--task` | FL task name (`reddit_nwp`, `cifar10`, `iot_anomaly`) |
+| `--results-tag` | Optional suffix for results filenames |
+| `--sensitivity` | Run DRO sensitivity analysis & ablation |
 
-## ⚙️ Notes
+## ⚙️ Simulation Modes
 
-- `configs/default.yaml` drives both simulation and placement.
-- `models/gnn/train.py` writes the GNN checkpoint path back into `configs/default.yaml` under `gnn.checkpoint`.
-- The GNN pipeline is separate from the core simulation; the simulation uses the GNN only if you enable or integrate it explicitly.
+### Static Mode (`duration_hours = 0`)
+1. Generate nodes → Build candidates/clients
+2. Run algorithm → Select servers
+3. Compute OTA metrics (AMSE_n, AMSE_kn)
+4. Generate comparison plots in `plots/`
 
-## ✅ Recommended Command Example
+### Dynamic Mode (`duration_hours > 0`)
+1. Generate nodes → Initialize weather
+2. For each time step (60s default): generate traffic → update channels → OTA control → compute AMSE/energy/latency/CVaR
+3. Re-select servers at outer interval (30 min default)
+4. Save CSV metrics per algorithm in `results/`
+
+### Key Algorithms
+| Algorithm | Signature |
+|-----------|-----------|
+| All baselines | `(candidates, clients, budget, cost, thresh, alpha, beta, delta_list, N, t_now=None, **kwargs)` |
+| Random | Accepts `seed` kwarg (re-randomizes each outer loop) |
+| DR-greedy | Extra: `epsilon`, `alpha_cvar`, `coherence_time`, `sigma_snr`, `gnn_checkpoint`, `kappa`, `tau_amse` |
+
+## 🔑 Key Implementation Details
+
+1. **Node types**: `SATELLITE`, `UAV`, `GROUND`, `CLIENT` (Enum in `nodes.py`)
+2. **Position handling**: Skyfield for satellite orbital propagation; HAPs use station-keeping box; clients have mobility models (60% stationary, 20% pedestrian 1 m/s, 20% vehicular 15 m/s)
+3. **Channel model**: `SaginChannelModel` computes SNR with Rician fading per link type
+4. **AMSE computation**: Hierarchical AirComp in `aircomp.py` — tier-specific cascaded errors
+5. **Hybrid patching**: `patching.py` for quantization bounds in hierarchical aggregation
+6. **GNN input features**: Position (3), velocity (3), SNR stats (4: mean/max/min/std), load (1), one-hot type (4) = 15 features
+7. **DRO parameters**: `N` scenarios, `ε` (ambiguity radius), `α_CVaR` (0.95), coherence_time, `σ_snr`
+6. **All algorithms re-select** at each outer interval (client mobility + orbital motion)
+
+## 📊 Output Files
+
+- `plots/` — AMSE comparisons, grouped bars, algorithm benchmarks
+- `results/<algo>_metrics.csv` — Per-step metrics: latency, AMSE, energy, CVaR@95/90/99, tier counts
+- `checkpoints/sagin_hgnn.pt` + `.meta.pkl` — GNN checkpoint & metadata (input dims, normalization)
+
+## ✅ Recommended Commands
 
 ```bash
-python -m simulation.run_simulation --config configs/default.yaml --algorithm da --budget 20 --seed 42
-```
+# Static comparison (all algorithms)
+python -m simulation.run_simulation --config configs/default.yaml --algorithm all --seed 42
 
-```bash
-python -m simulation.run_simulation --config configs/default.yaml --algorithm dr_greedy --budget 20 --results-tag exp1
+# DR-greedy with GNN pruning (kappa=0.6)
+python -m simulation.run_simulation --config configs/default.yaml --algorithm dr_greedy --budget 50 --seed 42
+
+# DRO sensitivity analysis
+python -m simulation.run_simulation --config configs/default.yaml --algorithm dr_greedy --budget 50 --sensitivity
+
+# Federated learning experiment
+python -m simulation.run_simulation --config configs/default.yaml --fl --task reddit_nwp --algorithm da
 ```
