@@ -5,6 +5,8 @@ from matplotlib import pyplot as plt
 import os
 import shutil
 import logging
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from skyfield.api import load
 
 from simulation.config_loader import load_config
@@ -42,6 +44,7 @@ def parse_args():
     parser.add_argument("--task", type=str, default=None, help="FL task to run (e.g. 'reddit_nwp', 'cifar10', 'iot_anomaly'). Runs all if omitted.")
     parser.add_argument("--results-tag", type=str, default="", help="Optional suffix tag for result CSV filenames")
     parser.add_argument("--sensitivity", action="store_true", help="Run DRO sensitivity analysis and ablation")
+    parser.add_argument("--parallel", action="store_true", help="Run algorithms in parallel using multiple processes")
     return parser.parse_args()
 
 
@@ -677,10 +680,138 @@ def _run_bilevel_simulation(
     log.info(f"[{tag}] Saved: {csv_path}")
 
 
+def _worker_static_algorithm(args):
+    """
+    Worker function for parallel static algorithm execution.
+    Must be top-level for Windows compatibility.
+    """
+    (name, algo_func, config_params, budget, thresh, alpha, beta, delta_list,
+     N, target_snr, sigma2, gradient_dim) = args
+
+    # Set single-threaded BLAS to prevent CPU oversubscription
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+    # Regenerate nodes in worker process (Skyfield objects can't be pickled)
+    ts = load.timescale()
+    start = ts.now()
+
+    nodes = generate_nodes(
+        num_sats=config_params['num_sats'],
+        num_uavs=config_params['num_uavs'],
+        num_ground=config_params['num_ground'],
+        num_clients=config_params['num_clients'],
+        area_size=config_params['area_size'],
+        gradient_dim=config_params['gradient_dim'],
+        t0=start
+    )
+
+    clients = [n for n in nodes if n.type == NodeType.CLIENT]
+    candidates = [n for n in nodes if n.type != NodeType.CLIENT]
+    cost = build_costs(candidates)
+
+    # Run algorithm
+    selected_servers = algo_func(
+        candidates=candidates,
+        clients=clients,
+        budget=budget,
+        cost=cost,
+        thresh=thresh,
+        alpha=alpha,
+        beta=beta,
+        delta_list=delta_list,
+        N=N
+    )
+
+    # Compute OTA metrics
+    amse_n, amse_kn_avg, amse_kn_min, amse_kn_max, _ = compute_ota_metrics(
+        selected_servers, clients, target_snr, delta_list, sigma2, gradient_dim, t_now=None
+    )
+
+    return {
+        'name': name,
+        'selected_servers': selected_servers,
+        'amse_n': amse_n,
+        'amse_kn_avg': amse_kn_avg,
+        'amse_kn_min': amse_kn_min,
+        'amse_kn_max': amse_kn_max
+    }
+
+
+def _worker_dynamic_algorithm(args):
+    """
+    Worker function for parallel dynamic algorithm execution.
+    Must be top-level for Windows compatibility.
+    """
+    (name, algo_func, config_params, budget, thresh, alpha, beta,
+     delta_list, duration_hours, time_step_seconds, outer_interval_minutes, target_snr,
+     N, results_tag, seed) = args
+
+    # Set single-threaded BLAS
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+    # Regenerate nodes in worker process (Skyfield objects can't be pickled)
+    ts = load.timescale()
+    start = ts.now()
+
+    nodes = generate_nodes(
+        num_sats=config_params['num_sats'],
+        num_uavs=config_params['num_uavs'],
+        num_ground=config_params['num_ground'],
+        num_clients=config_params['num_clients'],
+        area_size=config_params['area_size'],
+        gradient_dim=config_params['gradient_dim'],
+        t0=start
+    )
+
+    clients = [n for n in nodes if n.type == NodeType.CLIENT]
+    candidates = [n for n in nodes if n.type != NodeType.CLIENT]
+    cost = build_costs(candidates)
+
+    # Initial selection
+    init_kwargs = dict(
+        candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+        alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=start
+    )
+    if 'random' in name.lower():
+        init_kwargs['seed'] = seed if seed is not None else 0
+
+    selected = algo_func(**init_kwargs)
+
+    # Run bilevel simulation
+    _run_bilevel_simulation(
+        initial_selected=selected,
+        clients=clients,
+        nodes=nodes,
+        tag=f"{name}{results_tag}",
+        duration_hours=duration_hours,
+        time_step_seconds=time_step_seconds,
+        outer_interval_minutes=outer_interval_minutes,
+        target_snr=target_snr,
+        N=N,
+        candidates=candidates,
+        budget=budget,
+        cost=cost,
+        thresh=thresh,
+        placement_algo=algo_func,
+        alpha=alpha,
+        beta=beta,
+        delta_list=delta_list,
+        inner_iterations=5,
+        maml_lr=0.01
+    )
+
+    return {'name': name, 'status': 'completed'}
+
+
 def run_full_sweep(
     algorithms, nodes, clients, candidates, budget, cost, thresh, alpha, beta, delta_list, duration_hours,
-    time_step_seconds, outer_interval_minutes, target_snr, N, results_tag="", sensitivity=False
+    time_step_seconds, outer_interval_minutes, target_snr, N, results_tag="", sensitivity=False, parallel=False, seed=None
 ):
+    # Clean results directory ONLY in main process (not in workers)
     if os.path.exists("results"):
         log.warning("Results directory already exists. New results will be added but old files may be overwritten if names collide.")
         shutil.rmtree("results")
@@ -735,47 +866,83 @@ def run_full_sweep(
                 alpha=alpha, beta=beta, delta_list=delta_list
             )
     else:
-        for name, algo in algorithms.items():
-            log.info("Running simulation for algorithm: %s", name)
+        if parallel and len(algorithms) > 1:
+            log.info(f"Running {len(algorithms)} algorithms in PARALLEL mode")
+            # Prepare config parameters for worker processes
+            config_params = {
+                'num_sats': sum(1 for n in nodes if n.type == NodeType.SATELLITE),
+                'num_uavs': sum(1 for n in nodes if n.type == NodeType.UAV),
+                'num_ground': sum(1 for n in nodes if n.type == NodeType.GROUND),
+                'num_clients': len(clients),
+                'area_size': 2000,  # Default from config
+                'gradient_dim': delta_list[0] if delta_list else 100  # Use first delta as proxy
+            }
+            # Prepare arguments for parallel execution
+            worker_args = []
+            for name, algo_func in algorithms.items():
+                worker_args.append((
+                    name, algo_func, config_params, budget, thresh, alpha, beta,
+                    delta_list, duration_hours, time_step_seconds,
+                    outer_interval_minutes, target_snr, N, results_tag, seed
+                ))
 
-            t_now = start  # use start time for initial selection
-            init_kwargs = dict(
-                candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
-                alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
-            )
-            if 'random' in name.lower():
-                init_kwargs['seed'] = 0  # reproducible initial placement for the random baseline
-            selected = algo(**init_kwargs)
+            # Run in parallel with ProcessPoolExecutor
+            max_workers = min(len(algorithms), mp.cpu_count())
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_worker_dynamic_algorithm, args): args[0]
+                          for args in worker_args}
 
-            # Run bilevel simulation for this algorithm
-            _run_bilevel_simulation(
-                initial_selected=selected,
-                clients=clients,
-                nodes=nodes,
-                tag=f"{name}{results_tag}",
-                duration_hours=duration_hours,
-                time_step_seconds=time_step_seconds,
-                outer_interval_minutes=outer_interval_minutes,
-                target_snr=target_snr,
-                N=N,
-                candidates=candidates,
-                budget=budget,
-                cost=cost,
-                thresh=thresh,
-                placement_algo=algo,
-                alpha=alpha,
-                beta=beta,
-                delta_list=delta_list,
-                inner_iterations=5,
-                maml_lr=0.01
-            )
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        result = future.result()
+                        log.info(f"[{name}] Completed successfully")
+                    except Exception as e:
+                        log.error(f"[{name}] Failed: {e}")
+                        raise
+        else:
+            # Sequential execution
+            for name, algo in algorithms.items():
+                log.info("Running simulation for algorithm: %s", name)
+
+                t_now = start  # use start time for initial selection
+                init_kwargs = dict(
+                    candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+                    alpha=alpha, beta=beta, delta_list=delta_list, N=N, t_now=t_now
+                )
+                if 'random' in name.lower():
+                    init_kwargs['seed'] = 0  # reproducible initial placement for the random baseline
+                selected = algo(**init_kwargs)
+
+                # Run bilevel simulation for this algorithm
+                _run_bilevel_simulation(
+                    initial_selected=selected,
+                    clients=clients,
+                    nodes=nodes,
+                    tag=f"{name}{results_tag}",
+                    duration_hours=duration_hours,
+                    time_step_seconds=time_step_seconds,
+                    outer_interval_minutes=outer_interval_minutes,
+                    target_snr=target_snr,
+                    N=N,
+                    candidates=candidates,
+                    budget=budget,
+                    cost=cost,
+                    thresh=thresh,
+                    placement_algo=algo,
+                    alpha=alpha,
+                    beta=beta,
+                    delta_list=delta_list,
+                    inner_iterations=5,
+                    maml_lr=0.01
+                )
 
 
 def main():
     args = parse_args()
     log.info("=== SAGIN Simulation START ===")
-    log.info("Args: config=%s  algorithm=%s  fl=%s  seed=%s  budget=%s",
-             args.config, args.algorithm, args.fl, args.seed, args.budget)
+    log.info("Args: config=%s  algorithm=%s  fl=%s  seed=%s  budget=%s  parallel=%s",
+             args.config, args.algorithm, args.fl, args.seed, args.budget, args.parallel)
 
     config = load_config(args.config)
     log.info("Config loaded from %s", args.config)
@@ -881,46 +1048,98 @@ def main():
             N=num_scenarios,
             results_tag=args.results_tag,
             sensitivity=args.sensitivity,
+            parallel=args.parallel,
+            seed=args.seed,
         )
     else:
         # Static test mode (single placement + metrics)
         log.info("Running STATIC TEST mode (duration=0)")
+
+        # Clear results directory ONCE in main process only
+        if os.path.exists("results"):
+            log.warning("Results directory already exists. New results will be added but old files may be overwritten if names collide.")
+            shutil.rmtree("results")
+        os.makedirs("results", exist_ok=True)
+
         total_amse_n = {}
         total_amse_kn_avg = {}
         total_amse_kn_min = {}
         total_amse_kn_max = {}
 
-        for name, algo in active_algorithms.items():
-            print(f'\n=== Running {name} ===', flush=True)
-            selected_servers = algo(
-                candidates=candidates,
-                clients=clients,
-                budget=budget,
-                cost=cost,
-                thresh=thresh,
-                alpha=alpha,
-                beta=beta,
-                delta_list=delta_list,
-                N=num_scenarios
-            )
+        if args.parallel and len(active_algorithms) > 1:
+            # Parallel execution
+            log.info(f"Running {len(active_algorithms)} algorithms in PARALLEL mode")
+            # Prepare config parameters for worker processes
+            config_params = {
+                'num_sats': num_sats,
+                'num_uavs': num_uavs,
+                'num_ground': num_ground,
+                'num_clients': num_clients,
+                'area_size': area_size,
+                'gradient_dim': gradient_dim
+            }
+            worker_args = []
+            for name, algo_func in active_algorithms.items():
+                worker_args.append((
+                    name, algo_func, config_params, budget, thresh, alpha, beta,
+                    delta_list, num_scenarios, target_snr, sigma2, gradient_dim
+                ))
 
-            print(f'--- Algorithm {name} Summary ---')
-            print(f"Area size: {area_size} x {area_size}")
-            print(f"Total nodes: {len(nodes)} | Clients: {len(clients)}")
-            print(f"Budget: {budget} | Selected: {len(selected_servers)} servers")
-            print(summarize_selection(selected_servers))
+            # Execute in parallel
+            max_workers = min(len(active_algorithms), mp.cpu_count())
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_worker_static_algorithm, args): args[0]
+                          for args in worker_args}
 
-            # Compute OTA-aware metrics
-            amse_n, amse_kn_avg, amse_kn_min, amse_kn_max, _ = compute_ota_metrics(
-                selected_servers, clients, target_snr, delta_list, sigma2, gradient_dim, t_now=None
-            )
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        result = future.result()
+                        algo_name = result['name']
+                        print(f'\n=== Completed {algo_name} ===', flush=True)
+                        print(f"Budget: {budget} | Selected: {len(result['selected_servers'])} servers")
+                        print(summarize_selection(result['selected_servers']))
 
-            total_amse_n[name] = amse_n
-            total_amse_kn_avg[name] = amse_kn_avg
-            total_amse_kn_min[name] = amse_kn_min
-            total_amse_kn_max[name] = amse_kn_max
+                        total_amse_n[algo_name] = result['amse_n']
+                        total_amse_kn_avg[algo_name] = result['amse_kn_avg']
+                        total_amse_kn_min[algo_name] = result['amse_kn_min']
+                        total_amse_kn_max[algo_name] = result['amse_kn_max']
+                    except Exception as e:
+                        log.error(f"[{name}] Failed: {e}")
+                        raise
+        else:
+            # Sequential execution
+            for name, algo in active_algorithms.items():
+                print(f'\n=== Running {name} ===', flush=True)
+                selected_servers = algo(
+                    candidates=candidates,
+                    clients=clients,
+                    budget=budget,
+                    cost=cost,
+                    thresh=thresh,
+                    alpha=alpha,
+                    beta=beta,
+                    delta_list=delta_list,
+                    N=num_scenarios
+                )
 
-        # Generate comparison plots
+                print(f'--- Algorithm {name} Summary ---')
+                print(f"Area size: {area_size} x {area_size}")
+                print(f"Total nodes: {len(nodes)} | Clients: {len(clients)}")
+                print(f"Budget: {budget} | Selected: {len(selected_servers)} servers")
+                print(summarize_selection(selected_servers))
+
+                # Compute OTA-aware metrics
+                amse_n, amse_kn_avg, amse_kn_min, amse_kn_max, _ = compute_ota_metrics(
+                    selected_servers, clients, target_snr, delta_list, sigma2, gradient_dim, t_now=None
+                )
+
+                total_amse_n[name] = amse_n
+                total_amse_kn_avg[name] = amse_kn_avg
+                total_amse_kn_min[name] = amse_kn_min
+                total_amse_kn_max[name] = amse_kn_max
+
+        # Generate comparison plots (always in main process)
         print("\nGenerating comparison plots...")
         plot_amse_n(total_amse_n, output_dir="plots", log_scale=True)
         plot_amse_kn_grouped(total_amse_kn_avg, total_amse_kn_min, total_amse_kn_max, output_dir="plots", log_scale=True)
@@ -931,4 +1150,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # Required for Windows multiprocessing support
+    mp.freeze_support()
     main()

@@ -1,7 +1,7 @@
 simulation:
-  num_sats: 36
-  num_uavs: 10
-  num_ground: 20
+  num_sats: 10
+  num_uavs: 20
+  num_ground: 30
   num_clients: 500
   area_size: 2000
   gradient_dim: 100
@@ -73,7 +73,7 @@ algorithm:
   num_scenarios: 64
 gnn:
   checkpoint: checkpoints/sagin_hgnn.pt
-  kappa: 1
+  kappa: 0.6
   epochs: 200
   batch_size: 512
   lr: 0.001
