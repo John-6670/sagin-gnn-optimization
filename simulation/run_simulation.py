@@ -986,11 +986,11 @@ def main():
         # "lop": lop_selection,
         # "go": go_selection,
         # "nrs": nrs_selection,
-        "random": random_selection,
+        # "random": random_selection,
         # "da": da_selection,
         # "fedsn": fedsn_selection,
         # "hsfl": hsfl_selection,
-        # "dr_greedy": dr_selection,
+        "dr_greedy": dr_selection,
     }
 
     # Decide which algorithms to run
