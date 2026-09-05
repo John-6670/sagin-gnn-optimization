@@ -526,6 +526,7 @@ def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours,
         alpha=alpha,
         beta=beta,
         delta_list=delta_list,
+        reselect=True,
     )
 
 
@@ -534,7 +535,7 @@ def _run_bilevel_simulation(
     time_step_seconds, outer_interval_minutes, target_snr, N,
     candidates=None, budget=None, cost=None, thresh=None,
     placement_algo=None, alpha=None, beta=None, delta_list=None,
-    inner_iterations=5, maml_lr=0.01
+    inner_iterations=5, maml_lr=0.01, reselect=False
 ):
     """
     Two-timescale bilevel simulation (Algorithm 3 from paper):
@@ -578,6 +579,15 @@ def _run_bilevel_simulation(
     log.info(f"[{tag}] Starting bilevel simulation: {len(selected)} initial servers, "
              f"T_fast={time_step_seconds}s, T_slow={outer_interval_minutes}min")
 
+    # Topology liveness probe: sample one node of each moving type at step 0,
+    # then re-log at each outer boundary to prove positions evolve with t_now.
+    probe_nodes = {}
+    for _n in nodes:
+        if _n.type in (NodeType.SATELLITE, NodeType.UAV, NodeType.CLIENT) and _n.type not in probe_nodes:
+            probe_nodes[_n.type] = _n
+    for _t, _n in probe_nodes.items():
+        log.info(f"[{tag}][TOPO-PROBE] step=0 {_t.value} id={_n.id} pos={np.round(_n.get_position_at(start), 4).tolist()}")
+
     total_steps = int((duration_hours * 3600) // time_step_seconds)
     outer_steps = int((outer_interval_minutes * 60) / time_step_seconds)
 
@@ -596,27 +606,27 @@ def _run_bilevel_simulation(
             if hasattr(n, 'channel_model'):
                 n.channel_model.set_weather_loss_db(loss_db)
 
-        # === OUTER LOOP: Re-run placement every T_slow (only for DRO-based algorithms) ===
-        if step == 0 or (step % outer_steps == 0):
+        # Topology liveness probe at each outer boundary
+        if step > 0 and step % outer_steps == 0:
+            for _t, _n in probe_nodes.items():
+                log.info(f"[{tag}][TOPO-PROBE] step={step} {_t.value} id={_n.id} pos={np.round(_n.get_position_at(t_now), 4).tolist()}")
+
+        # === OUTER LOOP: Re-run placement every T_slow (only for re-selecting algorithms) ===
+        if reselect and placement_algo is not None and (step == 0 or (step % outer_steps == 0)):
             log.info(f"[{tag}] Step {step}: Running OUTER loop (placement re-selection)")
             old_selected = selected
 
-            # Every algorithm re-computes its placement each outer loop against the
-            # current topology/channel/client state.
-            if placement_algo is not None:
-                # Expire stale orbital-average SNR before re-selection (satellite
-                # geometry changes over the 30-min outer interval)
-                clear_orbital_cache()
-                kwargs = dict(
-                    candidates=candidates, clients=clients, budget=budget, cost=cost,
-                    thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list,
-                    N=N, t_now=t_now
-                )
-                if 'random' in tag.lower():
-                    kwargs['seed'] = int(step)  # re-randomize each interval
-                selected = placement_algo(**kwargs)
-            else:
-                selected = old_selected
+            # Expire stale orbital-average SNR before re-selection (satellite
+            # geometry changes over the 30-min outer interval)
+            clear_orbital_cache()
+            kwargs = dict(
+                candidates=candidates, clients=clients, budget=budget, cost=cost,
+                thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list,
+                N=N, t_now=t_now
+            )
+            if 'random' in tag.lower():
+                kwargs['seed'] = int(step)  # re-randomize each interval
+            selected = placement_algo(**kwargs)
 
             if len(old_selected) != len(selected) or any(s1.id != s2.id for s1, s2 in zip(old_selected, selected)):
                 log.info(f"[{tag}] Server re-selection at step {step}: "
@@ -801,7 +811,8 @@ def _worker_dynamic_algorithm(args):
         beta=beta,
         delta_list=delta_list,
         inner_iterations=5,
-        maml_lr=0.01
+        maml_lr=0.01,
+        reselect=name.lower() in ("dr_greedy", "random"),
     )
 
     return {'name': name, 'status': 'completed'}
@@ -934,7 +945,8 @@ def run_full_sweep(
                     beta=beta,
                     delta_list=delta_list,
                     inner_iterations=5,
-                    maml_lr=0.01
+                    maml_lr=0.01,
+                    reselect=name.lower() in ("dr_greedy", "random"),
                 )
 
 
@@ -971,14 +983,14 @@ def main():
 
     # ====================== Algorithms Dictionary ======================
     algorithms = {
-        "lop": lop_selection,
-        "go": go_selection,
-        "nrs": nrs_selection,
+        # "lop": lop_selection,
+        # "go": go_selection,
+        # "nrs": nrs_selection,
         "random": random_selection,
-        "da": da_selection,
-        "fedsn": fedsn_selection,
-        "hsfl": hsfl_selection,
-        "dr_greedy": dr_selection,
+        # "da": da_selection,
+        # "fedsn": fedsn_selection,
+        # "hsfl": hsfl_selection,
+        # "dr_greedy": dr_selection,
     }
 
     # Decide which algorithms to run
