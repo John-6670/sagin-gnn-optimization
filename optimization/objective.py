@@ -118,6 +118,33 @@ def _compute_objective_core(servers, clients, alpha, beta, delta_list, snr_map=N
     return total_cost
 
 
+def _make_objective_cache_key(servers, clients, snr_map, latency_map, alpha, beta,
+                               latency_scale, amse_scale, use_hierarchical, t_now):
+    """Build a hashable cache key for compute_objective."""
+    server_ids = tuple(sorted(getattr(s, 'id', id(s)) for s in servers))
+    client_ids = tuple(sorted(getattr(c, 'id', id(c)) for c in clients))
+    snr_key = None
+    if snr_map is not None:
+        # Use object identity of the dict as a proxy — same snr_map object reused
+        # across calls is the common case in local_one_swap.
+        snr_key = id(snr_map)
+    latency_key = None
+    if latency_map is not None:
+        latency_key = id(latency_map)
+    return (server_ids, client_ids, snr_key, latency_key,
+            alpha, beta, latency_scale, amse_scale, use_hierarchical,
+            str(t_now) if t_now is not None else None)
+
+
+_objective_cache = {}
+_OBJECTIVE_CACHE_MAX = 512
+
+
+def clear_objective_cache():
+    global _objective_cache
+    _objective_cache = {}
+
+
 def compute_objective(servers, clients, alpha, beta, delta_list, snr_map=None, latency_map=None,
                       fl_result=None, use_ota=True, latency_scale=None, amse_scale=None,
                       use_hierarchical=True, t_now=None):
@@ -125,9 +152,26 @@ def compute_objective(servers, clients, alpha, beta, delta_list, snr_map=None, l
     Composite objective per Eq. 7 - MINIMIZE this value.
     Returns: total cost (lower = better)
 
-    Note: Backward compatibility alias - calls _compute_objective_core
+    Results are memoized on (server_ids, client_ids, snr_map id, latency_map id, ...)
+    because local_one_swap evaluates the same (S, scenario) pairs many times.
     """
-    return _compute_objective_core(servers, clients, alpha, beta, delta_list, snr_map, latency_map, use_hierarchical, t_now)
+    key = _make_objective_cache_key(
+        servers, clients, snr_map, latency_map, alpha, beta,
+        latency_scale, amse_scale, use_hierarchical, t_now,
+    )
+    cached = _objective_cache.get(key)
+    if cached is not None:
+        return cached
+
+    result = _compute_objective_core(
+        servers, clients, alpha, beta, delta_list, snr_map, latency_map,
+        use_hierarchical, t_now,
+    )
+
+    if len(_objective_cache) >= _OBJECTIVE_CACHE_MAX:
+        _objective_cache.clear()
+    _objective_cache[key] = result
+    return result
 
 
 def compute_placement_utility(servers, clients, alpha, beta, delta_list, snr_map=None, latency_map=None, use_hierarchical=True, t_now=None):

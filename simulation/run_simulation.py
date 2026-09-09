@@ -530,12 +530,22 @@ def _run_single_dro_simulation(selected, clients, nodes, tag, duration_hours,
     )
 
 
+def _write_csv_rows(csv_path, rows, header_written):
+    """Append rows to CSV, creating header if needed. Thread/process-safe via file lock."""
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, 'a', newline='') as f:
+        if not header_written:
+            f.write('step,latency,amse,energy,cvar95,cvar90,cvar99,num_sat,num_uav,num_ground\n')
+        for r in rows:
+            f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]},{r[6]},{r[7]},{r[8]},{r[9]}\n")
+
+
 def _run_bilevel_simulation(
     initial_selected, clients, nodes, tag, duration_hours,
     time_step_seconds, outer_interval_minutes, target_snr, N,
     candidates=None, budget=None, cost=None, thresh=None,
     placement_algo=None, alpha=None, beta=None, delta_list=None,
-    inner_iterations=5, maml_lr=0.01, reselect=False
+    inner_iterations=5, maml_lr=0.01, reselect=False, save_interval=10
 ):
     """
     Two-timescale bilevel simulation (Algorithm 3 from paper):
@@ -590,6 +600,14 @@ def _run_bilevel_simulation(
 
     total_steps = int((duration_hours * 3600) // time_step_seconds)
     outer_steps = int((outer_interval_minutes * 60) / time_step_seconds)
+
+    # Incremental CSV saving: write every `save_interval` steps to avoid
+    # losing all progress if the simulation is interrupted. Each algorithm
+    # writes to its own file ({tag}_metrics.csv) so parallel workers never
+    # contend for the same file.
+    csv_path = f"results/{tag}_metrics.csv"
+    os.makedirs("results", exist_ok=True)
+    _csv_header_written = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
 
     for step in range(total_steps):
         t_now = start + (step * time_step_seconds) / 86400.0
@@ -675,18 +693,21 @@ def _run_bilevel_simulation(
         num_ground = sum(1 for s in selected if s.type.value == "ground")
         rows.append((step, lat, amse, energy, cvar5, cvar10, cvar1, num_sat, num_uav, num_ground))
 
+        # Incremental CSV flush every save_interval steps
+        if step % save_interval == 0 and step > 0:
+            _write_csv_rows(csv_path, rows[-save_interval:], _csv_header_written)
+            _csv_header_written = True  # header is written after first call
+            rows.clear()  # free memory
+
         if step % 10 == 0:
             log.info(f"[{tag}] Step {step:3d} | Servers: {len(selected)} | "
                     f"AMSE: {amse:.4e} | Energy: {energy:.2f} | "
                     f"CVaR95: {cvar5:.4e} | Dev(S,U,G)=({num_sat},{num_uav},{num_ground}) "
                     f"seleceted servers: {[s.id for s in selected]}")
 
-    csv_path = f"results/{tag}_metrics.csv"
-    os.makedirs("results", exist_ok=True)
-    with open(csv_path, 'w') as f:
-        f.write('step,latency,amse,energy,cvar95,cvar90,cvar99,num_sat,num_uav,num_ground\n')
-        for r in rows:
-            f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]},{r[6]},{r[7]},{r[8]},{r[9]}\n")
+    # Flush any remaining rows
+    if rows:
+        _write_csv_rows(csv_path, rows, _csv_header_written)
     log.info(f"[{tag}] Saved: {csv_path}")
 
 
@@ -756,7 +777,7 @@ def _worker_dynamic_algorithm(args):
     """
     (name, algo_func, config_params, budget, thresh, alpha, beta,
      delta_list, duration_hours, time_step_seconds, outer_interval_minutes, target_snr,
-     N, results_tag, seed) = args
+     N, results_tag, seed, save_interval) = args
 
     # Set single-threaded BLAS
     os.environ["OMP_NUM_THREADS"] = "1"
@@ -813,6 +834,7 @@ def _worker_dynamic_algorithm(args):
         inner_iterations=5,
         maml_lr=0.01,
         reselect=name.lower() in ("dr_greedy", "random"),
+        save_interval=save_interval,
     )
 
     return {'name': name, 'status': 'completed'}
@@ -894,7 +916,7 @@ def run_full_sweep(
                 worker_args.append((
                     name, algo_func, config_params, budget, thresh, alpha, beta,
                     delta_list, duration_hours, time_step_seconds,
-                    outer_interval_minutes, target_snr, N, results_tag, seed
+                    outer_interval_minutes, target_snr, N, results_tag, seed, 10
                 ))
 
             # Run in parallel with ProcessPoolExecutor
@@ -925,7 +947,7 @@ def run_full_sweep(
                     init_kwargs['seed'] = 0  # reproducible initial placement for the random baseline
                 selected = algo(**init_kwargs)
 
-                # Run bilevel simulation for this algorithm
+                # Run bilevel simulation for this algorithm (save_interval=10: write CSV every 10 steps)
                 _run_bilevel_simulation(
                     initial_selected=selected,
                     clients=clients,
@@ -947,6 +969,7 @@ def run_full_sweep(
                     inner_iterations=5,
                     maml_lr=0.01,
                     reselect=name.lower() in ("dr_greedy", "random"),
+                    save_interval=10,
                 )
 
 
@@ -983,13 +1006,13 @@ def main():
 
     # ====================== Algorithms Dictionary ======================
     algorithms = {
-        # "lop": lop_selection,
-        # "go": go_selection,
-        # "nrs": nrs_selection,
-        # "random": random_selection,
-        # "da": da_selection,
-        # "fedsn": fedsn_selection,
-        # "hsfl": hsfl_selection,
+        "lop": lop_selection,
+        "go": go_selection,
+        "nrs": nrs_selection,
+        "random": random_selection,
+        "da": da_selection,
+        "fedsn": fedsn_selection,
+        "hsfl": hsfl_selection,
         "dr_greedy": dr_selection,
     }
 

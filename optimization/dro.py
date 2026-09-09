@@ -311,10 +311,26 @@ def robust_marginal_gain(S, v, scenarios: ScenarioBundle, epsilon: float, alpha_
 
 
 def local_one_swap(S, candidates, budget, cost, scenarios: ScenarioBundle, epsilon, alpha_cvar,
-                    max_iter: int = 20, tol: float = 1e-6):
+                    max_iter: int = 2, tol: float = 1e-6):
     S = list(S)
     iter_no = 0
     seen_configs = set()
+
+    # Precompute latency map for all client-candidate pairs to avoid
+    # repeated expensive get_latency_to() calls inside robust_marginal_gain.
+    # The bundle may already have one from dr_greedy_server_selection; if not,
+    # build it here so the latency loops below don't recompute per scenario.
+    if scenarios.latency_map is None:
+        latency_map = {}
+        t_now = scenarios.t_now
+        for c in scenarios.clients:
+            latency_map[c] = {}
+            for s in list(S) + list(candidates):
+                latency_map[c][s] = float(c.get_latency_to(s, t_now))
+        scenarios.latency_map = latency_map
+        logger.info("local_one_swap: precomputed latency map for %d clients x %d servers",
+                    len(scenarios.clients), len(latency_map.get(scenarios.clients[0], {})) if scenarios.clients else 0)
+
     while iter_no < max_iter:
         iter_no += 1
         logger.info("local_one_swap iteration %d: current set size=%d", iter_no, len(S))
