@@ -47,28 +47,74 @@ The codebase supports simulation, baseline comparisons, GNN dataset generation/t
 └── results/                  # CSV metrics per algorithm
 ```
 
-## 🚀 Quick Start
+# 🚀 Quick Start
 
-### 1. Install dependencies
+### 1. Run the complete pipeline
+
+The `run_full.sh` script automates the entire setup and experiment pipeline. It automatically:
+
+1. Creates a Python virtual environment (`.venv`) if it does not already exist.
+2. Installs the required dependencies.
+3. Generates GNN training samples.
+4. Trains the GNN model.
+5. Runs the simulation.
+6. Generates plots of the results.
+
+Simply run:
+
+```bash
+bash run_full.sh
+```
+
+This is the recommended command for running the project from scratch.
+
+### 2. Run the simulation with an existing trained model
+
+If the GNN model has already been trained, you can skip dataset generation and GNN training by running:
+
+```bash
+bash run_sim_only.sh
+```
+
+This script performs the same steps as run_full.sh, except it skips:
+
+- GNN training sample generation.
+- GNN model training.
+
+### 3. If you are unable to run those bash scripts you can run following commands manually:
+
+#### 1. Install dependencies
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Run a simulation (static test mode)
+#### 2. Generate GNN training samples
+
+``` bash
+python models/gnn/precompute_dataset.py
+```
+
+#### 3. Train the GNN model
+
+```bash
+python models/gnn/train.py
+```
+
+#### 4. Run a simulation (static test mode)
 ```bash
 python -m simulation.run_simulation --config configs/default.yaml --algorithm dr_greedy --budget 50 --seed 42
 ```
 
-### 3. Run all algorithms for comparison
+#### 5. Run all algorithms for comparison
 ```bash
-python -m simulation.run_simulation --config configs/default.yaml --algorithm all --seed 42
+python -m simulation.run_simulation --config configs/default.yaml --algorithm all --seed 42 --parallel
 ```
 
-### 4. Dynamic mode (time-evolving, duration > 0 in config)
+#### 6. Dynamic mode (time-evolving, duration > 0 in config)
 ```bash
-python -m simulation.run_simulation --config configs/default.yaml --algorithm all --duration 1
+python -m simulation.run_simulation --config configs/default.yaml --algorithm all --duration 1 --parallel
 ```
 
 ## 🧩 Configuration
@@ -143,7 +189,7 @@ python models/gnn/train.py
 
 ### 3. Run simulation with GNN-enhanced selection
 ```bash
-python -m simulation.run_simulation --config configs/default.yaml --algorithm dr_greedy --budget 50
+python -m simulation.run_simulation --config configs/default.yaml --algorithm dr_greedy --budget 50 --parallel
 ```
 GNN scores candidates by marginal utility gain; downweights satellites (0.6×) and UAVs (0.85×).
 
