@@ -236,7 +236,7 @@ def hsfl_selection(
         if total_cost + c_cost <= budget:
             selected.append(s)
             total_cost += c_cost
-            print(f"  → HSFL Selected {s.id} ({s.type.value}) | Eff={eff:.4f} | SNR={snr:.2f} | Lat={lat:.1f}ms")
+            print(f"  -> HSFL Selected {s.id} ({s.type.value}) | Eff={eff:.4f} | SNR={snr:.2f} | Lat={lat:.1f}ms")
         else:
             break
 

@@ -20,7 +20,7 @@ from simulation.evaluation.metrics import compute_e2e_latency, compute_total_ene
 from optimization.placement import predictive_ota_control
 from optimization.baselines import da_selection, lop_selection, go_selection, nrs_selection, random_selection, dr_selection, fedsn_selection, hsfl_selection
 from fl.tasks import get_task_registry
-from fl.trainer import FederatedRound
+from fl.trainer import FederatedRound, run_fl_experiment
 from fl.convergence import convergence_monitor
 
 logging.basicConfig(
@@ -869,7 +869,7 @@ def run_full_sweep(
         ]
 
         for tag, b, n_scen, eps, kap, alp in sensitivity_cases:
-            print(f"→ DRO Sensitivity: {tag}")
+            print(f"-> DRO Sensitivity: {tag}")
             selected = dr_algo(
                 candidates=candidates, clients=clients, budget=b, cost=cost,
                 thresh=thresh, alpha=alp, beta=beta, delta_list=delta_list,
@@ -890,7 +890,7 @@ def run_full_sweep(
         }
 
         for name, sel_func in ablation_cases.items():
-            print(f"→ DRO Ablation: {name}")
+            print(f"-> DRO Ablation: {name}")
             selected = sel_func()
             _run_single_dro_simulation(
                 selected, clients, nodes, f"dr_ablation_{name}",
@@ -1086,6 +1086,55 @@ def main():
             parallel=args.parallel,
             seed=args.seed,
         )
+
+        # === FL Integration at End of Simulation (Requirement 7) ===
+        # Run FL using DR-Greedy selected servers on final constant topology
+        if "dr_greedy" in active_algorithms:
+            log.info("=== Running FL at end of simulation with DR-Greedy servers ===")
+            try:
+                # Re-run DR-Greedy to get final server selection at t_now
+                final_t_now = start + (duration_hours * 3600) / 86400.0
+                final_selected = dr_selection(
+                    candidates=candidates, clients=clients, budget=budget, cost=cost,
+                    thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list,
+                    N=num_scenarios, t_now=final_t_now, epsilon=0.1, kappa=0.3
+                )
+
+                log.info(f"Final DR-Greedy selection: {len(final_selected)} servers")
+                for s in final_selected:
+                    log.info(f"  {s.type.value}: {s.id}")
+
+                # Run FL experiment
+                if args.task:
+                    task_name = args.task
+                else:
+                    task_name = "reddit_nwp"  # default task
+
+                task = get_task_registry()[task_name]
+                client_loaders, test_loader = task.get_data_loaders(len(clients))
+
+                fl_summary = run_fl_experiment(
+                    task_name=task_name,
+                    task=task,
+                    clients=clients,
+                    servers=final_selected,
+                    client_loaders=client_loaders,
+                    test_loader=test_loader,
+                    delta_list=delta_list,
+                    num_rounds=20,  # Requirement: 20 rounds
+                    use_hybrid=True,
+                    t_now=final_t_now,
+                    csv_dir="results/fl",
+                    algo_name="dr_greedy",
+                )
+
+                log.info(f"FL Experiment completed: Final Acc={fl_summary.get('final_accuracy', 'N/A'):.4f}, "
+                         f"Mean AMSE={fl_summary.get('mean_amse', 'N/A'):.6f}, "
+                         f"Total Time={fl_summary.get('total_wallclock', 'N/A'):.1f}s")
+            except Exception as e:
+                log.error(f"FL experiment failed: {e}")
+                import traceback
+                traceback.print_exc()
     else:
         # Static test mode (single placement + metrics)
         log.info("Running STATIC TEST mode (duration=0)")

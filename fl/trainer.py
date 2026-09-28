@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from simulation.topology.patching import hybrid_patch, aircomp_aggregate
 
-from fl.convergence import ConvergenceTracker
+from fl.convergence import ConvergenceTracker, convergence_monitor
 from .device import DEVICE
 
 log = logging.getLogger("fl.trainer")
