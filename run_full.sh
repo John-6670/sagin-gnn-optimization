@@ -20,11 +20,11 @@ pip install -r requirements.txt
 
 # --- 4. GNN dataset generation ---
 echo "[gnn] generating precomputed dataset"
-python models/gnn/precompute_dataset.py
+python -m models.gnn.precompute_dataset
 
 # --- 5. GNN training ---
 echo "[gnn] training GNN"
-python models/gnn/train.py
+python -m models.gnn.train
 
 # --- 6. Simulation ---
 echo "[sim] running simulation"
@@ -32,6 +32,6 @@ python -m simulation.run_simulation --config configs/default.yaml --algorithm te
 
 # --- 7. Comparison plots ---
 echo "[compare] generating comparison plots"
-python plots_script/comparison_all_metrics.py
+python -m plots_script.comparison_all_metrics
 
 echo "[done] full pipeline finished"

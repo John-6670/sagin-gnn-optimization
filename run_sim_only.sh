@@ -26,6 +26,6 @@ python -m simulation.run_simulation --config configs/default.yaml --algorithm te
 
 # --- 5. Comparison plots ---
 echo "[compare] generating comparison plots"
-python plots_script/comparison_all_metrics.py
+python -m plots_script.comparison_all_metrics
 
 echo "[done] simulation pipeline finished"
