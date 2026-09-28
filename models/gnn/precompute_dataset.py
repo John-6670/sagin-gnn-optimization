@@ -8,7 +8,7 @@ from models.gnn.dataset import get_gnn_datasets
 
 
 NUM_PROCESSES = 10
-SAMPLES_PER_PROCESS = 10
+SAMPLES_PER_PROCESS = 600
 BASE_SEED = 42
 
 OUTPUT_DIR = "precomputed_dataset"
