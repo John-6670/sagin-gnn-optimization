@@ -20,7 +20,7 @@ from simulation.evaluation.metrics import compute_e2e_latency, compute_total_ene
 from optimization.placement import predictive_ota_control
 from optimization.baselines import da_selection, lop_selection, go_selection, nrs_selection, random_selection, dr_selection, fedsn_selection, hsfl_selection
 from fl.tasks import get_task_registry
-from fl.trainer import FederatedRound, run_fl_experiment
+from fl.trainer import FederatedRound, run_fl_experiment, CONVERGENCE_TRACKER
 from fl.convergence import convergence_monitor
 
 logging.basicConfig(
@@ -366,14 +366,18 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
     else:
         tasks = all_tasks
 
+    # Use fewer clients for FL (e.g., 50 instead of all 200) with proper non-IID partitioning
+    num_fl_clients = min(50, len(clients))
+    fl_clients = clients[:num_fl_clients]
+
     for task_name, task in tasks.items():
         log.info(f"--- FL Task: {task_name} ---")
-        client_loaders, test_loader = task.get_data_loaders(len(clients), seed=123)
+        client_loaders, test_loader = task.get_data_loaders(num_fl_clients, seed=123)
 
         for alg_name, algo in algorithms.items():
             log.info(f"[{alg_name}] Running server placement...")
             selected = algo(
-                candidates=candidates, clients=clients, budget=budget, cost=cost,
+                candidates=candidates, clients=fl_clients, budget=budget, cost=cost,
                 thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list
             )
 
@@ -383,48 +387,55 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
 
             log.info(f"[{alg_name}] Selected {len(selected)} servers")
 
-            # === Run full FL training ===
-            model = task.get_model()
-            amse_hist, loss_hist, acc_hist = [], [], []
-            num_rounds = 20
+            # === Run full FL training using improved run_fl_experiment ===
+            fl_summary = run_fl_experiment(
+                task_name=task_name,
+                task=task,
+                clients=fl_clients,
+                servers=selected,
+                client_loaders=client_loaders,
+                test_loader=test_loader,
+                delta_list=delta_list,
+                num_rounds=20,
+                use_hybrid=True,
+                t_now=None,
+                csv_dir=os.path.join(output_dir, "fl"),
+                algo_name=alg_name,
+                client_sampling_rate=0.2,  # 20% client participation per round
+                seed=42,
+            )
 
-            for r in range(num_rounds):
-                t_now_r = t_now  # Use current outer loop time
-                snr_map = {c: {selected[0]: c.compute_snr_to(selected[0], t_now_r)} for c in clients}
-                res = FederatedRound(
-                    r, clients, selected, {}, task, model, client_loaders,
-                    test_loader, snr_map, delta_list, use_hybrid=True, t_now=t_now_r
-                )
-                amse_hist.append(res['amse'])
-                loss_hist.append(res['loss'])
-                acc_hist.append(res['accuracy'])
+            log.info(f"[{alg_name}] FL Result → Acc: {fl_summary.get('final_accuracy', 'N/A'):.4f} | "
+                     f"Mean AMSE: {fl_summary.get('mean_amse', 'N/A'):.6f} | Bound: {fl_summary.get('final_bound', 'N/A'):.4f}")
 
-            final_bound, logs = convergence_monitor(amse_hist, loss_hist, sigma2=1.0, rho=0.95, gamma=0.5)
-            
-            fl_feedback = {
-                'final_loss': logs[-1]['loss'],
-                'final_accuracy': acc_hist[-1],
-                'mean_amse': np.mean(amse_hist),
-                'final_bound': final_bound
-            }
-
-            log.info(f"[{alg_name}] FL Result → Acc: {acc_hist[-1]:.4f} | Mean AMSE: {fl_feedback['mean_amse']:.6f} | Bound: {final_bound:.4f}")
-
-            # Plot
-            x = np.arange(1, len(acc_hist)+1)
-            fig, ax = plt.subplots(figsize=(8,4))
-            ax.plot(x, acc_hist, label='Accuracy')
-            ax2 = ax.twinx()
-            ax2.plot(x, [l['theoretical_bound'] for l in logs], color='r', label='Theoretical Bound')
-            ax.set_title(f"FL {task_name} - {alg_name}")
-            ax.set_xlabel('Round')
-            ax.set_ylabel('Accuracy')
-            ax2.set_ylabel('Bound')
-            fig.legend()
-            fig.tight_layout()
-            plot_path = os.path.join(output_dir, f"fl_{task_name}_{alg_name}.png")
-            fig.savefig(plot_path, dpi=200)
-            plt.close(fig)
+            # Plot using convergence tracker data
+            tracker = CONVERGENCE_TRACKER
+            if tracker.accuracies:
+                x = np.arange(1, len(tracker.accuracies)+1)
+                fig, ax = plt.subplots(figsize=(8,4))
+                ax.plot(x, tracker.accuracies, label='Accuracy')
+                ax2 = ax.twinx()
+                # Get theoretical bounds from logs
+                bounds = [log.get('theoretical_bound', 0) for log in tracker.convergence_logs] if hasattr(tracker, 'convergence_logs') else []
+                if bounds:
+                    ax2.plot(x, bounds, color='r', label='Theoretical Bound')
+                ax.set_title(f"FL {task_name} - {alg_name}")
+                ax.set_xlabel('Round')
+                ax.set_ylabel('Accuracy')
+                ax2.set_ylabel('Bound')
+                fig.legend()
+                fig.tight_layout()
+                plot_path = os.path.join(output_dir, f"fl_{task_name}_{alg_name}.png")
+                fig.savefig(plot_path, dpi=200)
+                plt.close(fig)
+                # Reset tracker for next experiment
+                tracker.rounds = []
+                tracker.losses = []
+                tracker.accuracies = []
+                tracker.amses = []
+                tracker.wallclock_times = []
+                if hasattr(tracker, 'convergence_logs'):
+                    tracker.convergence_logs = []
 
     log.info("=== FL Experiments DONE ===")
 
@@ -1009,21 +1020,25 @@ def main():
             log.info(f"Running FL experiment for task: {task_name}")
 
             task = get_task_registry()[task_name]
-            client_loaders, test_loader = task.get_data_loaders(len(clients))
+            # Use fewer clients for FL (e.g., 50 instead of all 200) with proper non-IID partitioning
+            num_fl_clients = min(50, len(clients))
+            client_loaders, test_loader = task.get_data_loaders(num_fl_clients, seed=42)
 
             fl_summary = run_fl_experiment(
                 task_name=task_name,
                 task=task,
-                clients=clients,
+                clients=clients[:num_fl_clients],  # Use subset of clients for FL
                 servers=selected,
                 client_loaders=client_loaders,
                 test_loader=test_loader,
                 delta_list=delta_list,
-                num_rounds=12,  # Fixed at 12 rounds
+                num_rounds=20,  # More rounds for better convergence
                 use_hybrid=True,
                 t_now=t_now,
                 csv_dir="results/fl",
                 algo_name="dr_greedy",
+                client_sampling_rate=0.2,  # 20% client participation per round
+                seed=42,
             )
 
             log.info(f"FL Experiment completed: Final Acc={fl_summary.get('final_accuracy', 'N/A'):.4f}, "

@@ -52,16 +52,34 @@ def _write_fl_csv(csv_path, round_data, header_written):
 def FederatedRound(
     round_idx, clients, servers, ota_params, task, global_model,
     client_loaders, test_loader, snr_map, delta_list, use_hybrid=True,
-    t_now=None, csv_path=None, header_written=False
+    t_now=None, csv_path=None, header_written=False,
+    client_sampling_rate: float = 1.0, rng: np.random.Generator = None
 ):
-    """Run one FL round with wall-clock timing and optional CSV logging."""
+    """Run one FL round with wall-clock timing and optional CSV logging.
+
+    Args:
+        client_sampling_rate: Fraction of clients to sample per round (0.0-1.0).
+            If < 1.0, randomly samples clients each round (FedAvg-style).
+        rng: Random number generator for reproducible client sampling.
+    """
     round_start = time.perf_counter()
 
     p_t = 1.0
-    active = list(range(len(clients)))
+    num_clients = len(clients)
 
-    log.debug("  Round %d: all clients active (%d/%d)",
-              round_idx, len(active), len(clients))
+    # Client sampling (FedAvg-style partial participation)
+    if rng is None:
+        rng = np.random.default_rng(round_idx)  # Deterministic per round
+
+    if client_sampling_rate < 1.0:
+        num_active = max(1, int(num_clients * client_sampling_rate))
+        active = rng.choice(num_clients, num_active, replace=False).tolist()
+        active.sort()
+    else:
+        active = list(range(num_clients))
+
+    log.debug("  Round %d: %d/%d clients active (sampling_rate=%.2f)",
+              round_idx, len(active), num_clients, client_sampling_rate)
 
     grads = []
     for cid in active:
@@ -187,6 +205,8 @@ def run_fl_experiment(
     t_now=None,
     csv_dir: str = "results/fl",
     algo_name: str = "dr_greedy",
+    client_sampling_rate: float = 0.1,  # Default 10% client participation
+    seed: int = 42,
 ):
     """
     Run full FL experiment for specified rounds with CSV logging.
@@ -204,6 +224,9 @@ def run_fl_experiment(
         t_now: Current simulation time
         csv_dir: Directory to save CSV results
         algo_name: Algorithm name for file naming
+        client_sampling_rate: Fraction of clients to sample per round (0.0-1.0).
+            Default 0.1 (10%) for realistic FL with many clients.
+        seed: Random seed for reproducible client sampling.
 
     Returns:
         dict with final metrics and convergence logs
@@ -221,7 +244,7 @@ def run_fl_experiment(
     model = task.get_model()
     amse_hist, loss_hist, acc_hist, wallclock_hist = [], [], [], []
 
-    log.info(f"[{task_name}/{algo_name}] Starting FL experiment: {num_rounds} rounds, {len(servers)} server(s), {len(clients)} clients")
+    log.info(f"[{task_name}/{algo_name}] Starting FL experiment: {num_rounds} rounds, {len(servers)} server(s), {len(clients)} clients, sampling_rate={client_sampling_rate:.2f}")
 
     # Compute SNR map ONCE (static topology - servers/clients don't move during FL)
     from skyfield.api import load
@@ -229,12 +252,15 @@ def run_fl_experiment(
     t_now_r = t_now if t_now is not None else ts.now()
     snr_map = {c: {servers[0]: c.compute_snr_to(servers[0], t_now_r)} for c in clients}
 
+    rng = np.random.default_rng(seed)
+
     for r in range(num_rounds):
         header = (r == 0)
         res = FederatedRound(
             r, clients, servers, {}, task, model, client_loaders,
             test_loader, snr_map, delta_list, use_hybrid=use_hybrid,
-            t_now=t_now_r, csv_path=csv_path, header_written=header
+            t_now=t_now_r, csv_path=csv_path, header_written=header,
+            client_sampling_rate=client_sampling_rate, rng=rng
         )
 
         amse_hist.append(res['amse'])
@@ -242,8 +268,8 @@ def run_fl_experiment(
         acc_hist.append(res['accuracy'])
         wallclock_hist.append(res['wallclock_time'])
 
-        log.info("  [%s/%s] Round %2d/%d: acc=%.4f loss=%.6f amse=%.6f time=%.2fs",
-                 task_name, algo_name, r+1, num_rounds, res['accuracy'], res['loss'], res['amse'], res['wallclock_time'])
+        log.info("  [%s/%s] Round %2d/%d: acc=%.4f loss=%.6f amse=%.6f time=%.2fs (active=%d)",
+                 task_name, algo_name, r+1, num_rounds, res['accuracy'], res['loss'], res['amse'], res['wallclock_time'], res['active_clients'])
 
     final_bound, logs = convergence_monitor(amse_hist, loss_hist, wallclock_hist)
 

@@ -12,6 +12,8 @@ import os
 import time
 from typing import Dict, List, Tuple, Any
 from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 import numpy as np
 import pandas as pd
@@ -89,100 +91,165 @@ def get_pareto_mask_3d(points: np.ndarray) -> np.ndarray:
     return is_pareto
 
 
-def run_single_pareto_experiment(
-    algorithm_name: str,
-    algorithm_func,
-    candidates: List[Node],
-    clients: List[Node],
-    budget: int,
-    cost: Dict[Node, float],
-    thresh: float,
-    alpha: float,
-    beta: float,
-    delta_list: List[float],
-    omega_l: float,
-    amax: int,
-    epsilon: float,
-    num_scenarios: int,
-    t_now,
+
+
+def run_pareto_seed_worker(
     seed: int,
-) -> ParetoResult:
-    """Run a single Pareto experiment configuration."""
-    start_time = time.perf_counter()
-
-    # Set seed for reproducibility
-    np.random.seed(seed)
-
-    # Compute effective alpha, beta from omega_l (alpha = omega_l, beta = 1 - omega_l)
-    eff_alpha = omega_l
-    eff_beta = 1.0 - omega_l
-
-    # Run algorithm with current parameters
-    if algorithm_name == "dr_greedy":
-        selected = algorithm_func(
-            candidates=candidates, clients=clients, budget=budget, cost=cost,
-            thresh=thresh, alpha=eff_alpha, beta=eff_beta, delta_list=delta_list,
-            N=num_scenarios, t_now=t_now, epsilon=epsilon, kappa=0.3
-        )
-    else:
-        selected = algorithm_func(
-            candidates=candidates, clients=clients, budget=budget, cost=cost,
-            thresh=thresh, alpha=eff_alpha, beta=eff_beta, delta_list=delta_list,
-            N=num_scenarios, t_now=t_now
-        )
-
-    # Compute metrics
-    if selected and clients:
-        # Latency
-        latency = compute_e2e_latency(clients, selected, t_now)
-
-        # AMSE (hierarchical)
-        tier_sync_errors = {1: 1e-9, 2: 5e-9, 3: 1e-8}
-        amse = compute_amse_hierarchical(
-            selected, clients, delta_list, t_now=t_now,
-            tier_sync_errors=tier_sync_errors
-        )
-
-        # Energy
-        from optimization.placement import run_inner_ota_loop
-        ota = run_inner_ota_loop(
-            selected_servers=selected,
-            clients=clients,
-            t_now=t_now,
-            target_snr=10.0,
-            traffic=0.5,
-            mobility=0.5,
-            inner_iterations=5,
-            maml_lr=0.01,
-            delta_list=delta_list
-        )
-        energy = compute_total_energy(clients, selected, ota, transmission_time=10, t_now=t_now)
-    else:
-        latency = float('inf')
-        amse = float('inf')
-        energy = float('inf')
-
-    runtime = time.perf_counter() - start_time
-
-    # Count server types
-    num_sat = sum(1 for s in selected if s.type == NodeType.SATELLITE)
-    num_uav = sum(1 for s in selected if s.type == NodeType.UAV)
-    num_ground = sum(1 for s in selected if s.type == NodeType.GROUND)
-
-    return ParetoResult(
-        algorithm=algorithm_name,
-        seed=seed,
-        omega_l=omega_l,
-        amax=amax,
-        epsilon=epsilon,
-        latency=latency,
-        amse=amse,
-        energy=energy,
-        runtime=runtime,
-        num_sat=num_sat,
-        num_uav=num_uav,
-        num_ground=num_ground,
+    config: ParetoConfig,
+    budget: int,
+    thresh: float,
+    delta_list: List[float],
+    num_scenarios: int,
+    output_dir: str,
+) -> List[ParetoResult]:
+    """Worker function: run all Pareto configs for ONE seed (full topology + all algos)."""
+    import numpy as np
+    import time
+    import csv
+    import os
+    from simulation.topology.nodes import NodeType, generate_nodes
+    from simulation.config_loader import load_config
+    from optimization.baselines import (
+        lop_selection, go_selection, nrs_selection, random_selection,
+        da_selection, fedsn_selection, hsfl_selection, dr_selection
     )
+    from simulation.evaluation.metrics import compute_e2e_latency, compute_total_energy
+    from simulation.topology.aircomp import compute_amse_hierarchical
+    from optimization.placement import run_inner_ota_loop
+    from simulation.run_simulation import build_costs
+    from skyfield.api import load
+
+    # Load base config for topology params
+    base_config = load_config("configs/default.yaml")
+    sim_config = base_config["simulation"]
+    num_sats = sim_config.get("num_sats", 1)
+    num_uavs = sim_config.get("num_uavs", 2)
+    num_ground = sim_config.get("num_ground", 4)
+    num_clients = sim_config.get("num_clients", 20)
+    area_size = sim_config.get("area_size", 2000)
+    gradient_dim = sim_config.get("gradient_dim", 100)
+
+    # Generate topology for this seed
+    ts = load.timescale()
+    t_now = ts.now()
+
+    np.random.seed(seed)
+    nodes = generate_nodes(
+        num_sats=num_sats,
+        num_uavs=num_uavs,
+        num_ground=num_ground,
+        num_clients=num_clients,
+        area_size=area_size,
+        gradient_dim=gradient_dim,
+        t0=t_now
+    )
+
+    clients = [n for n in nodes if n.type == NodeType.CLIENT]
+    candidates = [n for n in nodes if n.type != NodeType.CLIENT]
+    cost = build_costs(candidates)
+
+    all_results = []
+    csv_path = os.path.join(output_dir, f"pareto_results_seed_{seed}.csv")
+
+    # Write header for this seed's CSV
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'algorithm', 'seed', 'omega_l', 'amax', 'epsilon',
+            'latency', 'amse', 'energy', 'runtime',
+            'num_sat', 'num_uav', 'num_ground'
+        ])
+
+    for omega_l in config.omega_l_values:
+        for amax in config.amax_values:
+            for epsilon in config.epsilon_values:
+                for algo_name, algo_func in ALL_ALGORITHMS.items():
+                    start_time = time.perf_counter()
+                    np.random.seed(seed)
+
+                    eff_alpha = omega_l
+                    eff_beta = 1.0 - omega_l
+
+                    try:
+                        if algo_name == "dr_greedy":
+                            selected = algo_func(
+                                candidates=candidates, clients=clients, budget=budget, cost=cost,
+                                thresh=thresh, alpha=eff_alpha, beta=eff_beta, delta_list=delta_list,
+                                N=num_scenarios, t_now=t_now, epsilon=epsilon, kappa=0.3
+                            )
+                        else:
+                            selected = algo_func(
+                                candidates=candidates, clients=clients, budget=budget, cost=cost,
+                                thresh=thresh, alpha=eff_alpha, beta=eff_beta, delta_list=delta_list,
+                                N=num_scenarios, t_now=t_now
+                            )
+
+                        # Compute metrics
+                        if selected and clients:
+                            latency = compute_e2e_latency(clients, selected, t_now)
+
+                            tier_sync_errors = {1: 1e-9, 2: 5e-9, 3: 1e-8}
+                            amse = compute_amse_hierarchical(
+                                selected, clients, delta_list, t_now=t_now,
+                                tier_sync_errors=tier_sync_errors
+                            )
+
+                            ota = run_inner_ota_loop(
+                                selected_servers=selected,
+                                clients=clients,
+                                t_now=t_now,
+                                target_snr=10.0,
+                                traffic=0.5,
+                                mobility=0.5,
+                                inner_iterations=5,
+                                maml_lr=0.01,
+                                delta_list=delta_list
+                            )
+                            energy = compute_total_energy(clients, selected, ota, transmission_time=10, t_now=t_now)
+                        else:
+                            latency = float('inf')
+                            amse = float('inf')
+                            energy = float('inf')
+
+                        runtime = time.perf_counter() - start_time
+
+                        num_sat = sum(1 for s in selected if s.type == NodeType.SATELLITE)
+                        num_uav = sum(1 for s in selected if s.type == NodeType.UAV)
+                        num_ground = sum(1 for s in selected if s.type == NodeType.GROUND)
+
+                        result = ParetoResult(
+                            algorithm=algo_name,
+                            seed=seed,
+                            omega_l=omega_l,
+                            amax=amax,
+                            epsilon=epsilon,
+                            latency=latency,
+                            amse=amse,
+                            energy=energy,
+                            runtime=runtime,
+                            num_sat=num_sat,
+                            num_uav=num_uav,
+                            num_ground=num_ground,
+                        )
+                        all_results.append(result)
+
+                        # Append to seed CSV
+                        with open(csv_path, 'a', newline='') as f:
+                            writer = csv.writer(f)
+                            writer.writerow([
+                                result.algorithm, result.seed, result.omega_l,
+                                result.amax, result.epsilon,
+                                result.latency, result.amse, result.energy,
+                                result.runtime,
+                                result.num_sat, result.num_uav, result.num_ground
+                            ])
+                    except Exception as e:
+                        import logging
+                        log = logging.getLogger(__name__)
+                        log.error(f"Error in {algo_name} (seed={seed}, ωL={omega_l}, Amax={amax}, ε={epsilon}): {e}")
+                        continue
+
+    return all_results
 
 
 def run_pareto_experiments(
@@ -195,6 +262,7 @@ def run_pareto_experiments(
 ) -> List[ParetoResult]:
     """
     Run full Pareto front experiments sweeping parameters.
+    Parallelized across seeds (each seed generates its own topology and runs all algos).
 
     Args:
         config: ParetoConfig with sweep parameters
@@ -221,17 +289,6 @@ def run_pareto_experiments(
     if seeds is None:
         seeds = list(range(config.num_seeds))
 
-    # Load base config
-    base_config = load_config("configs/default.yaml")
-    sim_config = base_config["simulation"]
-    num_sats = sim_config.get("num_sats", 1)
-    num_uavs = sim_config.get("num_uavs", 2)
-    num_ground = sim_config.get("num_ground", 4)
-    num_clients = sim_config.get("num_clients", 20)
-    area_size = sim_config.get("area_size", 2000)
-    gradient_dim = sim_config.get("gradient_dim", 100)
-    sigma2 = sim_config.get("sigma2", 10)
-
     os.makedirs(config.output_dir, exist_ok=True)
     csv_path = os.path.join(config.output_dir, "pareto_results.csv")
 
@@ -250,69 +307,40 @@ def run_pareto_experiments(
 
     log.info(f"Starting Pareto experiments: {total_configs} total configurations")
 
-    config_idx = 0
-    for seed in seeds:
-        # Generate nodes for this seed
-        ts = load.timescale()
-        t_now = ts.now()
+    # Parallel across seeds (each worker generates topology + runs all algos)
+    max_workers = min(len(seeds), mp.cpu_count())
+    log.info(f"Using {max_workers} parallel workers across {len(seeds)} seeds")
 
-        nodes = generate_nodes(
-            num_sats=num_sats,
-            num_uavs=num_uavs,
-            num_ground=num_ground,
-            num_clients=num_clients,
-            area_size=area_size,
-            gradient_dim=gradient_dim,
-            t0=t_now
-        )
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_seed = {
+            executor.submit(
+                run_pareto_seed_worker,
+                seed, config, budget, thresh, delta_list, num_scenarios, config.output_dir
+            ): seed
+            for seed in seeds
+        }
 
-        clients = [n for n in nodes if n.type == NodeType.CLIENT]
-        candidates = [n for n in nodes if n.type != NodeType.CLIENT]
-        cost = build_costs(candidates)
+        completed_configs = 0
+        for future in as_completed(future_to_seed):
+            seed = future_to_seed[future]
+            try:
+                seed_results = future.result()
+                all_results.extend(seed_results)
+                completed_configs += len(seed_results)
+                log.info(f"Seed {seed} complete: {len(seed_results)} runs. Total: {completed_configs}/{total_configs}")
 
-        for omega_l in config.omega_l_values:
-            for amax in config.amax_values:
-                for epsilon in config.epsilon_values:
-                    for algo_name, algo_func in ALL_ALGORITHMS.items():
-                        config_idx += 1
-                        if config_idx % 50 == 0:
-                            log.info(f"Progress: {config_idx}/{total_configs}")
-
-                        try:
-                            result = run_single_pareto_experiment(
-                                algorithm_name=algo_name,
-                                algorithm_func=algo_func,
-                                candidates=candidates,
-                                clients=clients,
-                                budget=budget,
-                                cost=cost,
-                                thresh=thresh,
-                                alpha=omega_l,
-                                beta=1.0 - omega_l,
-                                delta_list=delta_list,
-                                omega_l=omega_l,
-                                amax=amax,
-                                epsilon=epsilon,
-                                num_scenarios=num_scenarios,
-                                t_now=t_now,
-                                seed=seed,
-                            )
-
-                            all_results.append(result)
-
-                            # Append to CSV incrementally
-                            with open(csv_path, 'a', newline='') as f:
-                                writer = csv.writer(f)
-                                writer.writerow([
-                                    result.algorithm, result.seed, result.omega_l,
-                                    result.amax, result.epsilon,
-                                    result.latency, result.amse, result.energy,
-                                    result.runtime,
-                                    result.num_sat, result.num_uav, result.num_ground
-                                ])
-                        except Exception as e:
-                            log.error(f"Error in {algo_name} (seed={seed}, ωL={omega_l}, Amax={amax}, ε={epsilon}): {e}")
-                            continue
+                # Merge seed CSV into main CSV
+                seed_csv = os.path.join(config.output_dir, f"pareto_results_seed_{seed}.csv")
+                if os.path.exists(seed_csv):
+                    with open(seed_csv, 'r') as sf, open(csv_path, 'a', newline='') as mf:
+                        reader = csv.reader(sf)
+                        writer = csv.writer(mf)
+                        next(reader)  # skip header
+                        for row in reader:
+                            writer.writerow(row)
+            except Exception as e:
+                log.error(f"Error in seed {seed}: {e}")
+                continue
 
     log.info(f"Pareto experiments complete. Results saved to {csv_path}")
     return all_results
