@@ -17,15 +17,31 @@ _config = load_config()
 class PrecomputedGraphDataset(Dataset):
     def __init__(self, path="precomputed_dataset", split="train"):
         self.files = sorted(Path(path).glob(f"sample_{split}_*.pt"))
+
         if not self.files:
-            self.files = sorted(Path(path).glob("sample_*.pt"))  # fallback
-        print(f"[Dataset] Loaded {len(self.files)} {split} samples from {path}")
+            self.files = sorted(Path(path).glob("sample_*.pt"))
+
+        print(f"[Dataset] Loading {len(self.files)} {split} samples into RAM...")
+
+        start = __import__("time").perf_counter()
+
+        self.data = [
+            torch.load(f, weights_only=False)
+            for f in self.files
+        ]
+
+        elapsed = __import__("time").perf_counter() - start
+
+        print(
+            f"[Dataset] Loaded {len(self.data)} {split} samples "
+            f"into RAM in {elapsed:.2f}s"
+        )
 
     def __len__(self):
-        return len(self.files)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        return torch.load(self.files[idx], weights_only=False)
+        return self.data[idx]
 
 
 def train_gnn(epochs=None, batch_size=None, lr=None, checkpoint_path=None):
@@ -44,10 +60,21 @@ def train_gnn(epochs=None, batch_size=None, lr=None, checkpoint_path=None):
     val_ds   = PrecomputedGraphDataset(path="precomputed_dataset", split="val")
     test_ds  = PrecomputedGraphDataset(path="precomputed_dataset", split="test")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              pin_memory=True, num_workers=4)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                              pin_memory=True, num_workers=2)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=0
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=0
+    )
 
     # Load one sample for metadata
     sample = torch.load("precomputed_dataset/sample_train_0.pt", weights_only=False) if train_ds.files else torch.load("precomputed_dataset/sample_0.pt", weights_only=False)

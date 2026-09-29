@@ -358,80 +358,6 @@ def plot_comparison_amse_kn(total_avg, total_min, total_max, output_dir="plots")
     plt.close(fig)
 
 
-# def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots", task_filter=None):
-#     os.makedirs(output_dir, exist_ok=True)
-#     all_tasks = get_task_registry()
-#     if task_filter:
-#         if task_filter not in all_tasks:
-#             raise ValueError(f"Unknown task '{task_filter}'. Available: {list(all_tasks.keys())}")
-#         tasks = {task_filter: all_tasks[task_filter]}
-#     else:
-#         tasks = all_tasks
-#     log.info("=== FL Experiments START | tasks=%s | algorithms=%s | clients=%d | candidates=%d | budget=%d ===",
-#              list(tasks.keys()), list(algorithms.keys()), len(clients), len(candidates), budget)
-#     for task_name, task in tasks.items():
-#         log.info("--- FL Task: %s | local_epochs=%d | lr=%s | optimizer=%s ---",
-#                  task_name, task.local_epochs, task.lr, task.optimizer)
-#         log.debug("  Loading data loaders for %d clients (seed=123)...", len(clients))
-#         client_loaders, test_loader = task.get_data_loaders(len(clients), seed=123)
-#         log.debug("  Data loaders ready.")
-#         for alg_name, algo in algorithms.items():
-#             log.info("  [%s / %s] Running server selection...", task_name, alg_name)
-#             selected = algo(
-#                 candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
-#                 alpha=alpha, beta=beta, delta_list=delta_list
-#             )
-#             if not selected:
-#                 log.warning("  [%s / %s] No servers selected — skipping.", task_name, alg_name)
-#                 continue
-#             log.info("  [%s / %s] Selected %d server(s): %s",
-#                      task_name, alg_name, len(selected),
-#                      [(s.id, s.type.value) for s in selected])
-
-#             model = task.get_model()
-#             log.debug("  [%s / %s] Model built: %s", task_name, alg_name, type(model).__name__)
-#             amse_hist = []
-#             loss_hist = []
-#             acc_hist = []
-#             num_rounds = 12
-#             for r in range(num_rounds):
-#                 log.info("  [%s / %s] Round %2d/%d — computing SNR map...", task_name, alg_name, r+1, num_rounds)
-#                 snr_map = {c: {selected[0]: c.compute_snr_to(selected[0])} for c in clients}
-#                 snr_vals = [list(v.values())[0] for v in snr_map.values()]
-#                 log.debug("    SNR stats: min=%.3e  max=%.3e  mean=%.3e",
-#                           min(snr_vals), max(snr_vals), float(np.mean(snr_vals)))
-#                 res = FederatedRound(
-#                     r, clients, selected, {}, task, model, client_loaders,
-#                     test_loader, snr_map, delta_list, use_hybrid=True
-#                 )
-#                 amse_hist.append(res['amse'])
-#                 loss_hist.append(res['loss'])
-#                 acc_hist.append(res['accuracy'])
-#                 log.info("    Round %2d result: active=%d  p_t=%.3f  amse=%.6f  loss=%.6f  acc=%.4f",
-#                          r+1, res['active_clients'], res['p_t'], res['amse'], res['loss'], res['accuracy'])
-
-#             _, logs = convergence_monitor(amse_hist, loss_hist, sigma2=1.0, rho=0.95, gamma=0.5)
-#             log.info("  [%s / %s] Convergence summary — final bound=%.6f  final acc=%.4f  final loss=%.6f",
-#                      task_name, alg_name, logs[-1]['theoretical_bound'], acc_hist[-1], loss_hist[-1])
-#             x = np.arange(1, len(acc_hist)+1)
-#             fig, ax = plt.subplots(figsize=(8,4))
-#             ax.plot(x, acc_hist, label='accuracy')
-#             ax2 = ax.twinx()
-#             ax2.plot(x, [l['theoretical_bound'] for l in logs], color='r', label='bound')
-#             ax.set_title(f"FL {task_name} - {alg_name}")
-#             ax.set_xlabel('round')
-#             ax.set_ylabel('acc')
-#             ax2.set_ylabel('bound')
-#             plt.legend()
-#             fig.legend()
-#             fig.tight_layout()
-#             plot_path = os.path.join(output_dir, f"fl_{task_name}_{alg_name}.png")
-#             fig.savefig(plot_path, dpi=200)
-#             plt.close(fig)
-#             log.info("  [%s / %s] Plot saved: %s", task_name, alg_name, plot_path)
-#     log.info("=== FL Experiments DONE ===")
-
-
 def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, alpha, beta, delta_list, output_dir="plots", task_filter=None):
     os.makedirs(output_dir, exist_ok=True)
     all_tasks = get_task_registry()
@@ -460,7 +386,7 @@ def run_fl_experiments(algorithms, candidates, clients, budget, cost, thresh, al
             # === Run full FL training ===
             model = task.get_model()
             amse_hist, loss_hist, acc_hist = [], [], []
-            num_rounds = 12
+            num_rounds = 20
 
             for r in range(num_rounds):
                 t_now_r = t_now  # Use current outer loop time
@@ -1054,12 +980,57 @@ def main():
     cost = build_costs(candidates)
 
     # ====================== FL Experiments ======================
+    # Run FL only with DR-Greedy (20 rounds), then continue to normal simulation
     if args.fl:
-        log.info("--- FL Experiments Mode ---")
-        run_fl_experiments(
-            active_algorithms, candidates, clients, budget, cost, thresh,
-            alpha, beta, delta_list, output_dir="plots", task_filter=args.task
+        log.info("--- FL Experiments Mode (DR-Greedy only, 20 rounds) ---")
+
+        # Select DR-Greedy algorithm
+        if "dr_greedy" not in algorithms:
+            raise ValueError("DR-Greedy algorithm not available for FL experiments")
+        dr_algo = algorithms["dr_greedy"]
+
+        # Run initial DR-Greedy placement
+        t_now = start
+        init_kwargs = dict(
+            candidates=candidates, clients=clients, budget=budget, cost=cost, thresh=thresh,
+            alpha=alpha, beta=beta, delta_list=delta_list, N=num_scenarios, t_now=t_now
         )
+        selected = dr_algo(**init_kwargs)
+
+        log.info(f"DR-Greedy selected {len(selected)} servers for FL")
+
+        # Run FL experiment with 12 rounds
+        all_tasks = get_task_registry()
+        
+        if args.task:
+            all_tasks = {args.task: all_tasks[args.task]}
+            
+        for task_name in all_tasks:
+            log.info(f"Running FL experiment for task: {task_name}")
+
+            task = get_task_registry()[task_name]
+            client_loaders, test_loader = task.get_data_loaders(len(clients))
+
+            fl_summary = run_fl_experiment(
+                task_name=task_name,
+                task=task,
+                clients=clients,
+                servers=selected,
+                client_loaders=client_loaders,
+                test_loader=test_loader,
+                delta_list=delta_list,
+                num_rounds=12,  # Fixed at 12 rounds
+                use_hybrid=True,
+                t_now=t_now,
+                csv_dir="results/fl",
+                algo_name="dr_greedy",
+            )
+
+            log.info(f"FL Experiment completed: Final Acc={fl_summary.get('final_accuracy', 'N/A'):.4f}, "
+                    f"Mean AMSE={fl_summary.get('mean_amse', 'N/A'):.6f}, "
+                    f"Total Time={fl_summary.get('total_wallclock', 'N/A'):.1f}s")
+
+        # Continue to normal simulation logic below (do NOT return/early exit)
 
     # ====================== Main Simulation Logic ======================
     if duration_hours > 0:
@@ -1086,55 +1057,6 @@ def main():
             parallel=args.parallel,
             seed=args.seed,
         )
-
-        # === FL Integration at End of Simulation (Requirement 7) ===
-        # Run FL using DR-Greedy selected servers on final constant topology
-        if "dr_greedy" in active_algorithms:
-            log.info("=== Running FL at end of simulation with DR-Greedy servers ===")
-            try:
-                # Re-run DR-Greedy to get final server selection at t_now
-                final_t_now = start + (duration_hours * 3600) / 86400.0
-                final_selected = dr_selection(
-                    candidates=candidates, clients=clients, budget=budget, cost=cost,
-                    thresh=thresh, alpha=alpha, beta=beta, delta_list=delta_list,
-                    N=num_scenarios, t_now=final_t_now, epsilon=0.1, kappa=0.3
-                )
-
-                log.info(f"Final DR-Greedy selection: {len(final_selected)} servers")
-                for s in final_selected:
-                    log.info(f"  {s.type.value}: {s.id}")
-
-                # Run FL experiment
-                if args.task:
-                    task_name = args.task
-                else:
-                    task_name = "reddit_nwp"  # default task
-
-                task = get_task_registry()[task_name]
-                client_loaders, test_loader = task.get_data_loaders(len(clients))
-
-                fl_summary = run_fl_experiment(
-                    task_name=task_name,
-                    task=task,
-                    clients=clients,
-                    servers=final_selected,
-                    client_loaders=client_loaders,
-                    test_loader=test_loader,
-                    delta_list=delta_list,
-                    num_rounds=20,  # Requirement: 20 rounds
-                    use_hybrid=True,
-                    t_now=final_t_now,
-                    csv_dir="results/fl",
-                    algo_name="dr_greedy",
-                )
-
-                log.info(f"FL Experiment completed: Final Acc={fl_summary.get('final_accuracy', 'N/A'):.4f}, "
-                         f"Mean AMSE={fl_summary.get('mean_amse', 'N/A'):.6f}, "
-                         f"Total Time={fl_summary.get('total_wallclock', 'N/A'):.1f}s")
-            except Exception as e:
-                log.error(f"FL experiment failed: {e}")
-                import traceback
-                traceback.print_exc()
     else:
         # Static test mode (single placement + metrics)
         log.info("Running STATIC TEST mode (duration=0)")

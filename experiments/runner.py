@@ -173,9 +173,9 @@ def run_all_experiments(
         pareto_start = time.time()
 
         pareto_config = ParetoConfig(
-            omega_l_values=[0.1, 0.3, 0.5, 0.7, 0.9],
-            amax_values=[10, 20, 30, 40],
-            epsilon_values=[0.05, 0.1, 0.2, 0.5],
+            omega_l_values=[0.3, 0.5, 0.7],
+            amax_values=[20],
+            epsilon_values=[0.05, 0.1, 0.2],
             num_seeds=3,
         )
 
@@ -191,8 +191,8 @@ def run_all_experiments(
         milp_start = time.time()
 
         milp_config = MILPConfig(
-            num_clients_list=[5, 6, 7, 8, 9, 10],
-            num_seeds=5,
+            num_clients_list=[5, 6, 7],
+            num_seeds=3,
         )
 
         milp_results = run_milp_optimality_experiments(config=milp_config, budget=budget)
@@ -207,10 +207,10 @@ def run_all_experiments(
         sens_start = time.time()
 
         sens_config = SensitivityConfig(
-            num_clients_list=[10, 20, 30, 40, 50],
-            num_satellites_list=[1, 2, 3, 4],
-            cvar_alpha_list=[0.90, 0.95, 0.99],
-            timing_error_std_list=[0.01, 0.05, 0.1, 0.2],
+            num_clients_list=[10, 20],
+            num_satellites_list=[1, 2],
+            cvar_alpha_list=[0.95, 0.99],
+            timing_error_std_list=[0.01, 0.05],
             num_seeds=3,
         )
 
@@ -226,8 +226,8 @@ def run_all_experiments(
         stat_start = time.time()
 
         stat_config = StatisticsConfig(
-            seeds=[42, 123, 456, 789, 999, 111, 222, 333, 444, 555],
-            num_bootstrap=10000,
+            seeds=[42, 123, 456, 789, 999],
+            num_bootstrap=1000,
             confidence_level=0.95,
         )
 

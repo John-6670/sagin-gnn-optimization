@@ -223,10 +223,13 @@ def run_fl_experiment(
 
     log.info(f"[{task_name}/{algo_name}] Starting FL experiment: {num_rounds} rounds, {len(servers)} server(s), {len(clients)} clients")
 
-    for r in range(num_rounds):
-        t_now_r = t_now
-        snr_map = {c: {servers[0]: c.compute_snr_to(servers[0], t_now_r)} for c in clients}
+    # Compute SNR map ONCE (static topology - servers/clients don't move during FL)
+    from skyfield.api import load
+    ts = load.timescale()
+    t_now_r = t_now if t_now is not None else ts.now()
+    snr_map = {c: {servers[0]: c.compute_snr_to(servers[0], t_now_r)} for c in clients}
 
+    for r in range(num_rounds):
         header = (r == 0)
         res = FederatedRound(
             r, clients, servers, {}, task, model, client_loaders,
