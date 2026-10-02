@@ -48,30 +48,31 @@ class RedditLSTM(nn.Module):
 
 
 class IoTAutoencoder(nn.Module):
-    def __init__(self, input_dim=8100):
+    def __init__(self, input_dim=11500):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
             nn.ReLU()
         )
         self.decoder = nn.Sequential(
-            nn.Linear(32, 64),
-            nn.ReLU(),
             nn.Linear(64, 128),
             nn.ReLU(),
-            nn.Linear(128, input_dim)
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, input_dim)
         )
 
     def forward(self, x):
         return self.decoder(self.encoder(x))
-    
+
     @staticmethod
     def make_iot_autoencoder():
-        model = IoTAutoencoder()
+        # Default to N-BaIoT dimension (100 timesteps * 115 features = 11500)
+        model = IoTAutoencoder(input_dim=11500)
         return model.to(DEVICE)  
     
 
@@ -213,19 +214,19 @@ def _iot(num_clients, seed=0):
     rng = np.random.default_rng(seed)
     windows_per_client = 200
     total_windows = num_clients * windows_per_client
-    input_dim = 8100   # 100 time steps × 81 features (flattened)
+    input_dim = 11500   # 100 time steps × 115 features (N-BaIoT compatible, flattened)
     # 70% normal, 30% anomaly
     normal_mask = rng.random(total_windows) < 0.7
     X = np.empty((total_windows, input_dim), dtype=np.float32)
     # Normal data: smooth temporal correlation (e.g., random walk + noise)
     n_normal = normal_mask.sum()
     for i in range(n_normal):
-        seq = np.cumsum(rng.normal(0, 0.1, size=(100, 81)), axis=0) + rng.normal(0, 0.5, size=(100, 81))
+        seq = np.cumsum(rng.normal(0, 0.1, size=(100, 115)), axis=0) + rng.normal(0, 0.5, size=(100, 115))
         X[i] = seq.flatten()
     # Anomalous data: sudden spikes or different pattern
     n_anom = total_windows - n_normal
     for i in range(n_normal, total_windows):
-        seq = rng.normal(0, 2.0, size=(100, 81))  # higher variance, no temporal structure
+        seq = rng.normal(0, 2.0, size=(100, 115))  # higher variance, no temporal structure
         X[i] = seq.flatten()
 
     # Shuffle
