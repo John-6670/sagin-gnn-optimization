@@ -244,10 +244,10 @@ def _iot(num_clients, seed=0):
     # so reconstruction loss reflects what the model actually learned.
     X_test_list = []
     for _ in range(700):
-        seq = np.cumsum(rng.normal(0, 0.1, size=(100, 81)), axis=0) + rng.normal(0, 0.5, size=(100, 81))
+        seq = np.cumsum(rng.normal(0, 0.1, size=(100, 115)), axis=0) + rng.normal(0, 0.5, size=(100, 115))
         X_test_list.append(seq.flatten())
     for _ in range(300):
-        seq = rng.normal(0, 2.0, size=(100, 81))
+        seq = rng.normal(0, 2.0, size=(100, 115))
         X_test_list.append(seq.flatten())
     X_test = np.array(X_test_list, dtype=np.float32)
     perm = rng.permutation(1000)
